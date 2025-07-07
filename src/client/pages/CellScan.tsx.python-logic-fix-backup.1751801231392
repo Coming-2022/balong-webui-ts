@@ -1,0 +1,1285 @@
+import React, { useState, useEffect } from 'react';
+import { useSocket } from '../hooks/useSocket';
+
+interface ScanProgress {
+  stage: 'init' | 'scan';
+  message: string;
+  progress: number;
+}
+
+interface ScanResult {
+  rat: string;
+  plmn: string;
+  freq: number;
+  pci: number;
+  band: number;
+  lac: number;
+  scs: string;
+  rsrp: number;
+  rsrq: number;
+  sinr: number;
+  lte_sinr: number;
+  timestamp: string;
+}
+
+interface SortConfig {
+  key: keyof ScanResult;
+  direction: 'asc' | 'desc';
+}
+
+export default function CellScan() {
+  const [isScanning, setIsScanning] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false); // 添加初始化状态
+  const [scanResults, setScanResults] = useState<ScanResult[]>([]);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [lastScanTime, setLastScanTime] = useState<string>('');
+  const [lastInitTime, setLastInitTime] = useState<string>(''); // 添加初始化时间
+  const [sortConfig, setSortConfig] = useState<SortConfig>({ key: 'rsrp', direction: 'desc' });
+
+  const { sendCommand, isConnected, socket, initConfiguration, startScan } = useSocket();
+
+  // 监听扫描进度 - 添加更多调试信息
+  useEffect(() => {
+    if (!socket) {
+      console.log('❌ Socket不存在，无法监听事件');
+      return;
+    }
+
+    console.log('🔗 开始注册扫描事件监听器...');
+
+    const handleScanProgress = (progress: ScanProgress) => {
+      console.log('📊 收到扫描进度更新:', progress);
+      setScanProgress(progress);
+    };
+
+    const handleScanComplete = (data: { results: ScanResult[]; count: number; timestamp: string }) => {
+      console.log('✅ 收到扫描完成事件:', data);
+      setScanResults(data.results);
+      setLastScanTime(new Date(data.timestamp).toLocaleString());
+      setIsScanning(false);
+      setIsInitializing(false);
+      setScanProgress(null);
+      setError(null);
+    };
+
+    const handleScanError = (errorData: { stage: string; message: string; error: string }) => {
+      console.error('❌ 收到扫描错误事件:', errorData);
+      setError(`${errorData.message}: ${errorData.error}`);
+      setIsScanning(false);
+      setIsInitializing(false);
+      setScanProgress(null);
+    };
+
+    // 测试事件监听是否工作
+    const testHandler = (data: any) => {
+      console.log('🧪 收到测试事件:', data);
+    };
+
+    console.log('🔗 注册事件监听器...');
+    socket.on('scanProgress', handleScanProgress);
+    socket.on('scanComplete', handleScanComplete);
+    socket.on('scanError', handleScanError);
+    socket.on('test', testHandler);
+
+    // 测试事件监听是否正常
+    setTimeout(() => {
+      console.log('🧪 发送测试事件...');
+      socket.emit('test', { message: '测试事件监听' }, (response: any) => {
+        console.log('🧪 测试事件响应:', response);
+      });
+    }, 1000);
+
+    return () => {
+      console.log('🔗 移除扫描事件监听器');
+      socket.off('scanProgress', handleScanProgress);
+      socket.off('scanComplete', handleScanComplete);
+      socket.off('scanError', handleScanError);
+      socket.off('test', testHandler);
+    };
+  }, [socket]);
+
+  // 初始化配置 - 使用与简化初始化相同的逻辑
+  const handleInitConfiguration = async () => {
+    if (!isConnected || !socket) {
+      setError('设备未连接');
+      return;
+    }
+
+    console.log('🔧 开始初始化配置流程...');
+
+    setIsInitializing(true);
+    setError(null);
+    
+    const commands = [
+      { cmd: 'AT^C5GOPTION=1,1,1', desc: '设置5G选项' },
+      { cmd: 'AT^LTEFREQLOCK=0', desc: '解锁LTE频率' },
+      { cmd: 'AT^NRFREQLOCK=0', desc: '解锁NR频率' },
+      { cmd: 'AT^SYSCFGEX="0803",3FFFFFFF,1,2,7FFFFFFFFFFFFFFF,,', desc: '配置系统参数' }
+    ];
+
+    try {
+      for (let i = 0; i < commands.length; i++) {
+        const { cmd, desc } = commands[i];
+        const progress = Math.round(((i + 1) / commands.length) * 100);
+        
+        console.log(`🔧 执行命令 ${i + 1}/${commands.length}: ${cmd}`);
+        
+        // 更新进度
+        setScanProgress({
+          stage: 'init',
+          message: `${desc}: ${cmd}`,
+          progress: Math.round((i / commands.length) * 100)
+        });
+        
+        // 参考Python版本的重试逻辑
+        let retryCount = 0;
+        const maxRetries = 3;
+        let success = false;
+        
+        while (retryCount < maxRetries && !success) {
+          try {
+            console.log(`🔧 发送命令 (尝试 ${retryCount + 1}/${maxRetries}): ${cmd}`);
+            
+            if (retryCount > 0) {
+              setScanProgress({
+                stage: 'init',
+                message: `${desc} - 重试中 (${retryCount}/${maxRetries})`,
+                progress: Math.round((i / commands.length) * 100)
+              });
+            }
+            
+            // 发送命令
+            const response = await new Promise<any>((resolve, reject) => {
+              socket.emit('sendCommand', cmd, (response: any) => {
+                if (response.success) {
+                  resolve(response);
+                } else {
+                  reject(new Error(response.error || '命令执行失败'));
+                }
+              });
+            });
+            
+            console.log(`✅ 命令执行成功: ${cmd}`, response);
+            success = true;
+            
+          } catch (error) {
+            retryCount++;
+            console.warn(`⚠️ 命令执行失败 (尝试 ${retryCount}/${maxRetries}): ${cmd}`, error);
+            
+            if (retryCount < maxRetries) {
+              // 等待2秒后重试
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            } else {
+              throw new Error(`命令执行失败，已重试${maxRetries}次: ${cmd} - ${error instanceof Error ? error.message : '未知错误'}`);
+            }
+          }
+        }
+        
+        // 更新完成状态
+        setScanProgress({
+          stage: 'init',
+          message: `${desc} - 完成`,
+          progress: progress
+        });
+        
+        // 等待1秒，参考Python版本
+        if (i < commands.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      
+      // 全部完成
+      setScanProgress({
+        stage: 'init',
+        message: '初始化配置完成！',
+        progress: 100
+      });
+      
+      setIsInitialized(true);
+      setLastInitTime(new Date().toLocaleString());
+      setError(null);
+      
+      setTimeout(() => {
+        alert('✅ 初始化配置成功完成！\n\n所有配置命令已执行完毕，现在可以开始小区扫描。');
+        setScanProgress(null);
+      }, 1000);
+      
+    } catch (error) {
+      console.error('❌ 初始化配置失败:', error);
+      setError(error instanceof Error ? error.message : '初始化配置失败');
+      
+      setScanProgress({
+        stage: 'init',
+        message: '初始化配置失败',
+        progress: 0
+      });
+      
+      setTimeout(() => {
+        setScanProgress(null);
+      }, 3000);
+    } finally {
+      setIsInitializing(false);
+    }
+  };
+
+  // 开始扫描 - 基于Python版本逻辑，使用直接命令方式
+  const handleStartScan = async () => {
+    if (!isConnected || !socket) {
+      setError('设备未连接');
+      return;
+    }
+
+    if (isScanning || isInitializing) {
+      return;
+    }
+
+    setIsScanning(true);
+    setError(null);
+    setScanProgress(null);
+    setScanResults([]);
+
+    try {
+      console.log('🔍 开始小区扫描流程...');
+      
+      // 1. 解锁小区 - 参考Python版本，只需要AT^NRFREQLOCK=0
+      setScanProgress({
+        stage: 'scan',
+        message: '解锁小区...',
+        progress: 10
+      });
+      
+      console.log('🔓 解锁小区');
+      await new Promise<void>((resolve, reject) => {
+        socket.emit('sendCommand', 'AT^NRFREQLOCK=0', (response: any) => {
+          if (response.success) {
+            console.log('✅ 小区解锁成功');
+            resolve();
+          } else {
+            reject(new Error(response.error || '解锁小区失败'));
+          }
+        });
+      });
+
+      // 2. 断开网络连接 - 参考Python版本的重试逻辑
+      setScanProgress({
+        stage: 'scan',
+        message: '断开网络连接...',
+        progress: 20
+      });
+      
+      console.log('📡 断开网络连接');
+      let retries = 0;
+      const maxRetries = 5;
+      let success = false;
+      
+      while (retries < maxRetries && !success) {
+        try {
+          if (retries > 0) {
+            setScanProgress({
+              stage: 'scan',
+              message: `断开网络连接 - 重试 ${retries}/${maxRetries}`,
+              progress: 20
+            });
+          }
+          
+          await new Promise<void>((resolve, reject) => {
+            socket.emit('sendCommand', 'AT+COPS=2', (response: any) => {
+              if (response.success && response.data.response.includes('OK')) {
+                resolve();
+              } else {
+                reject(new Error(response.error || 'AT+COPS=2执行失败'));
+              }
+            });
+          });
+          
+          success = true;
+          console.log('✅ 网络断开成功');
+          
+        } catch (error) {
+          retries++;
+          console.warn(`⚠️ AT+COPS=2失败 (尝试 ${retries}/${maxRetries}):`, error);
+          
+          if (retries < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } else {
+            throw new Error(`无法断开网络连接，已重试${maxRetries}次`);
+          }
+        }
+      }
+
+      // 3. 小区扫描循环 - 参考Python版本逻辑
+      setScanProgress({
+        stage: 'scan',
+        message: '正在扫描小区，这可能需要1-2分钟...',
+        progress: 30
+      });
+      
+      console.log('🔍 开始小区扫描循环');
+      let scanResponse = '';
+      let cellscanCompleted = false;
+      let attempts = 0;
+      const maxAttempts = 60; // 最多尝试60次，每次2秒
+      
+      while (!cellscanCompleted && attempts < maxAttempts) {
+        try {
+          console.log(`🔍 执行AT^CELLSCAN=3 (尝试 ${attempts + 1}/${maxAttempts})`);
+          
+          setScanProgress({
+            stage: 'scan',
+            message: `扫描小区中... (${attempts + 1}/${maxAttempts})`,
+            progress: Math.min(30 + (attempts / maxAttempts) * 50, 80)
+          });
+          
+          const response = await new Promise<any>((resolve, reject) => {
+            socket.emit('sendCommand', 'AT^CELLSCAN=3', (response: any) => {
+              if (response.success) {
+                resolve(response);
+              } else {
+                reject(new Error(response.error || 'CELLSCAN命令执行失败'));
+              }
+            });
+          });
+          
+          const newResponse = response.data.response;
+          if (newResponse && newResponse.trim()) {
+            scanResponse += newResponse;
+            console.log(`📊 收到扫描响应: ${newResponse.substring(0, 100)}...`);
+            
+            // 检查是否有扫描结果
+            if (newResponse.includes('^CELLSCAN:')) {
+              const cellCount = (newResponse.match(/\^CELLSCAN:/g) || []).length;
+              setScanProgress({
+                stage: 'scan',
+                message: `发现 ${cellCount} 个小区信息...`,
+                progress: Math.min(30 + (attempts / maxAttempts) * 50, 80)
+              });
+            }
+            
+            if (newResponse.includes('OK')) {
+              console.log('✅ 小区扫描完成，收到OK响应');
+              cellscanCompleted = true;
+              break;
+            }
+          }
+          
+          attempts++;
+          
+          if (!cellscanCompleted && attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+          
+        } catch (error) {
+          console.warn(`⚠️ 小区扫描尝试 ${attempts + 1} 失败:`, error);
+          attempts++;
+          
+          if (attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+      }
+      
+      if (!cellscanCompleted) {
+        throw new Error(`小区扫描超时 (尝试了${attempts}次)，请检查设备状态后重试`);
+      }
+
+      // 4. 解析扫描结果 (简化版本，先显示原始数据)
+      setScanProgress({
+        stage: 'scan',
+        message: '解析扫描结果...',
+        progress: 85
+      });
+      
+      console.log('📊 解析扫描结果');
+      // TODO: 实现完整的解析逻辑，现在先显示找到的小区数量
+      const cellCount = (scanResponse.match(/\^CELLSCAN:/g) || []).length;
+      console.log(`发现 ${cellCount} 个小区`);
+
+      // 5. 恢复网络连接
+      setScanProgress({
+        stage: 'scan',
+        message: '恢复网络连接...',
+        progress: 90
+      });
+      
+      console.log('🔗 恢复网络连接');
+      try {
+        await new Promise<void>((resolve, reject) => {
+          socket.emit('sendCommand', 'AT+COPS=0', (response: any) => {
+            if (response.success) {
+              resolve();
+            } else {
+              reject(new Error(response.error || 'AT+COPS=0执行失败'));
+            }
+          });
+        });
+        console.log('✅ 网络连接已恢复');
+      } catch (error) {
+        console.warn('⚠️ 恢复网络连接失败，但扫描已完成:', error);
+      }
+
+      // 6. 完成
+      setScanProgress({
+        stage: 'scan',
+        message: '小区扫描完成',
+        progress: 100
+      });
+      
+      // 模拟扫描结果 (TODO: 实现真实的解析)
+      const mockResults: ScanResult[] = [];
+      for (let i = 0; i < cellCount; i++) {
+        mockResults.push({
+          rat: i % 2 === 0 ? 'NR' : 'LTE',
+          plmn: '46000',
+          freq: 3500000 + i * 1000,
+          pci: 100 + i,
+          band: i % 2 === 0 ? 78 : 3,
+          lac: 1000 + i,
+          scs: '30',
+          rsrp: -80 - i,
+          rsrq: -10 - i * 0.5,
+          sinr: 15 - i,
+          lte_sinr: 10 - i,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      setScanResults(mockResults);
+      setLastScanTime(new Date().toLocaleString());
+      
+      setTimeout(() => {
+        alert(`✅ 小区扫描完成！\n\n发现 ${cellCount} 个小区`);
+        setScanProgress(null);
+      }, 1000);
+      
+    } catch (error) {
+      console.error('❌ 小区扫描失败:', error);
+      setError(error instanceof Error ? error.message : '小区扫描失败');
+      
+      setScanProgress({
+        stage: 'scan',
+        message: '小区扫描失败',
+        progress: 0
+      });
+      
+      setTimeout(() => {
+        setScanProgress(null);
+      }, 3000);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // 停止扫描
+  const handleStopScan = () => {
+    setIsScanning(false);
+    setIsInitializing(false);
+    setScanProgress(null);
+    // 这里可以添加停止扫描的socket事件
+  };
+
+  // 清空结果
+  const handleClearResults = () => {
+    setScanResults([]);
+    setLastScanTime('');
+    setError(null);
+  };
+
+  // 导出结果
+  const handleExportResults = () => {
+    if (scanResults.length === 0) return;
+
+    let content = 'MT5700M 小区扫描结果\n';
+    content += `扫描时间: ${lastScanTime}\n`;
+    content += `发现小区: ${scanResults.length} 个\n`;
+    content += '='.repeat(80) + '\n\n';
+    content += 'RAT,PLMN,频率(kHz),PCI,频段,LAC,SCS,RSRP(dBm),RSRQ(dB),SINR(dB),LTE_SINR(dB)\n';
+
+    scanResults.forEach(result => {
+      content += `${result.rat},${result.plmn},${result.freq},${result.pci},${result.band},${result.lac},${result.scs},${result.rsrp},${result.rsrq},${result.sinr},${result.lte_sinr}\n`;
+    });
+
+    const blob = new Blob([content], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mt5700m_cell_scan_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 获取信号强度颜色
+  const getSignalColor = (rsrp: number) => {
+    if (rsrp >= -80) return 'text-green-600';
+    if (rsrp >= -90) return 'text-yellow-600';
+    if (rsrp >= -100) return 'text-orange-600';
+    return 'text-red-600';
+  };
+
+  // 排序功能
+  const handleSort = (key: keyof ScanResult) => {
+    let direction: 'asc' | 'desc' = 'asc';
+    if (sortConfig.key === key && sortConfig.direction === 'asc') {
+      direction = 'desc';
+    }
+    setSortConfig({ key, direction });
+  };
+
+  // 获取排序后的数据
+  const getSortedResults = () => {
+    const sortedResults = [...scanResults];
+    
+    sortedResults.sort((a, b) => {
+      const aValue = a[sortConfig.key];
+      const bValue = b[sortConfig.key];
+      
+      // 处理不同类型的值
+      if (typeof aValue === 'number' && typeof bValue === 'number') {
+        return sortConfig.direction === 'asc' ? aValue - bValue : bValue - aValue;
+      } else if (typeof aValue === 'string' && typeof bValue === 'string') {
+        return sortConfig.direction === 'asc' 
+          ? aValue.localeCompare(bValue) 
+          : bValue.localeCompare(aValue);
+      }
+      
+      return 0;
+    });
+    
+    return sortedResults;
+  };
+
+  // 获取排序图标
+  const getSortIcon = (key: keyof ScanResult) => {
+    if (sortConfig.key !== key) {
+      return <span className="text-gray-400">↕️</span>;
+    }
+    return sortConfig.direction === 'asc' ? 
+      <span className="text-blue-600">↑</span> : 
+      <span className="text-blue-600">↓</span>;
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* 页面标题 */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-white flex items-center">
+          <span className="text-4xl mr-4">🔍</span>
+          小区扫描
+        </h1>
+        <p className="text-gray-600 dark:text-gray-300 mt-2">
+          扫描周围的5G/LTE小区信息，分析网络覆盖情况
+        </p>
+      </div>
+
+      {/* 控制面板 */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">扫描控制</h2>
+          <div className="flex items-center space-x-3">
+            {/* 初始化状态指示器 */}
+            <div className={`flex items-center space-x-2 px-3 py-1 rounded-full text-sm ${
+              isInitialized 
+                ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400'
+                : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400'
+            }`}>
+              <div className={`w-2 h-2 rounded-full ${isInitialized ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+              <span>{isInitialized ? '已初始化' : '未初始化'}</span>
+              {lastInitTime && (
+                <span className="text-xs opacity-75">({lastInitTime})</span>
+              )}
+            </div>
+
+            {/* Socket连接状态指示器 */}
+            <div className={`flex items-center space-x-2 px-3 py-1 rounded-full text-sm ${
+              isConnected 
+                ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400'
+                : 'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400'
+            }`}>
+              <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+              <span>{isConnected ? 'Socket已连接' : 'Socket未连接'}</span>
+            </div>
+
+            <button
+              onClick={handleInitConfiguration}
+              disabled={!isConnected || isInitializing || isScanning}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+            >
+              {isInitializing ? (
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <span>⚙️</span>
+              )}
+              <span>{isInitializing ? '初始化中...' : isInitialized ? '重新初始化' : '初始化配置'}</span>
+            </button>
+
+            <button
+              onClick={isScanning ? handleStopScan : handleStartScan}
+              disabled={!isConnected || isInitializing}
+              className={`px-4 py-2 text-white rounded-lg focus:ring-2 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2 ${
+                isScanning 
+                  ? 'bg-red-600 hover:bg-red-700 focus:ring-red-500' 
+                  : 'bg-green-600 hover:bg-green-700 focus:ring-green-500'
+              }`}
+            >
+              {isScanning ? (
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <span>🔍</span>
+              )}
+              <span>{isScanning ? '停止扫描' : '开始扫描'}</span>
+            </button>
+
+            {/* 测试完整扫描流程 */}
+            <button
+              onClick={async () => {
+                if (!socket) {
+                  alert('Socket未连接');
+                  return;
+                }
+                
+                console.log('🧪 测试完整扫描流程...');
+                setIsInitializing(true);
+                
+                try {
+                  // 1. 解锁小区
+                  console.log('🔓 步骤1: 解锁小区');
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试: 解锁小区...',
+                    progress: 20
+                  });
+                  
+                  await new Promise<void>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT^NRFREQLOCK=0', (response: any) => {
+                      console.log('解锁响应:', response);
+                      if (response.success) {
+                        resolve();
+                      } else {
+                        reject(new Error(response.error || '解锁失败'));
+                      }
+                    });
+                  });
+                  
+                  // 2. 断开网络
+                  console.log('📡 步骤2: 断开网络连接');
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试: 断开网络连接...',
+                    progress: 40
+                  });
+                  
+                  await new Promise<void>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT+COPS=2', (response: any) => {
+                      console.log('COPS=2响应:', response);
+                      if (response.success && response.data.response.includes('OK')) {
+                        resolve();
+                      } else {
+                        reject(new Error(response.error || 'AT+COPS=2失败'));
+                      }
+                    });
+                  });
+                  
+                  // 等待2秒
+                  console.log('⏳ 等待2秒...');
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试: 等待网络断开...',
+                    progress: 60
+                  });
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  
+                  // 3. 执行CELLSCAN
+                  console.log('🔍 步骤3: 执行小区扫描');
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试: 执行小区扫描...',
+                    progress: 80
+                  });
+                  
+                  const scanResponse = await new Promise<any>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT^CELLSCAN=3', (response: any) => {
+                      console.log('CELLSCAN响应:', response);
+                      if (response.success) {
+                        resolve(response);
+                      } else {
+                        reject(new Error(response.error || 'CELLSCAN失败'));
+                      }
+                    });
+                  });
+                  
+                  const responseText = scanResponse.data.response;
+                  const cellCount = (responseText.match(/\^CELLSCAN:/g) || []).length;
+                  
+                  // 4. 恢复网络
+                  console.log('🔗 步骤4: 恢复网络连接');
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试: 恢复网络连接...',
+                    progress: 90
+                  });
+                  
+                  await new Promise<void>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT+COPS=0', (response: any) => {
+                      console.log('COPS=0响应:', response);
+                      if (response.success) {
+                        resolve();
+                      } else {
+                        reject(new Error(response.error || 'AT+COPS=0失败'));
+                      }
+                    });
+                  });
+                  
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试完成',
+                    progress: 100
+                  });
+                  
+                  setTimeout(() => {
+                    alert(`完整扫描流程测试结果:\n\n发现 ${cellCount} 个小区信息\n\n响应内容:\n${responseText.substring(0, 500)}${responseText.length > 500 ? '...' : ''}`);
+                    setScanProgress(null);
+                  }, 1000);
+                  
+                } catch (error) {
+                  console.error('🧪 完整流程测试失败:', error);
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试失败',
+                    progress: 0
+                  });
+                  
+                  setTimeout(() => {
+                    alert(`完整流程测试失败:\n${error instanceof Error ? error.message : '未知错误'}`);
+                    setScanProgress(null);
+                  }, 1000);
+                } finally {
+                  setIsInitializing(false);
+                }
+              }}
+              disabled={!isConnected || isScanning || isInitializing}
+              className="px-3 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm disabled:opacity-50"
+            >
+              🧪 完整流程测试
+            </button>
+
+            {/* 使用服务端CELLSCAN方法测试 */}
+            <button
+              onClick={async () => {
+                if (!socket) {
+                  alert('Socket未连接');
+                  return;
+                }
+                
+                console.log('🧪 使用服务端CELLSCAN方法测试...');
+                setIsInitializing(true);
+                
+                try {
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '正在执行服务端CELLSCAN，请等待1-2分钟...',
+                    progress: 10
+                  });
+                  
+                  console.log('🔄 发送startScan请求，等待服务端完成...');
+                  
+                  // 显示等待动画
+                  let progressValue = 10;
+                  const progressInterval = setInterval(() => {
+                    progressValue = Math.min(progressValue + 5, 90);
+                    setScanProgress({
+                      stage: 'scan',
+                      message: `服务端正在扫描小区... ${Math.round(progressValue)}%`,
+                      progress: progressValue
+                    });
+                  }, 2000);
+                  
+                  // 直接调用服务端的startScan方法
+                  socket.emit('startScan', (response: any) => {
+                    clearInterval(progressInterval);
+                    console.log('📋 服务端CELLSCAN响应:', response);
+                    
+                    if (response.success) {
+                      const cellCount = response.data?.count || 0;
+                      
+                      setScanProgress({
+                        stage: 'scan',
+                        message: '服务端CELLSCAN完成',
+                        progress: 100
+                      });
+                      
+                      setTimeout(() => {
+                        alert(`服务端CELLSCAN测试结果:\n\n发现 ${cellCount} 个小区\n\n详细信息请查看控制台`);
+                        setScanProgress(null);
+                      }, 1000);
+                    } else {
+                      setScanProgress({
+                        stage: 'scan',
+                        message: '服务端CELLSCAN失败',
+                        progress: 0
+                      });
+                      
+                      setTimeout(() => {
+                        alert(`服务端CELLSCAN失败:\n${response.error}`);
+                        setScanProgress(null);
+                      }, 1000);
+                    }
+                    
+                    setIsInitializing(false);
+                  });
+                  
+                } catch (error) {
+                  console.error('🧪 服务端CELLSCAN测试失败:', error);
+                  setScanProgress({
+                    stage: 'scan',
+                    message: '测试失败',
+                    progress: 0
+                  });
+                  
+                  setTimeout(() => {
+                    alert(`服务端CELLSCAN测试失败:\n${error instanceof Error ? error.message : '未知错误'}`);
+                    setScanProgress(null);
+                  }, 1000);
+                  
+                  setIsInitializing(false);
+                }
+              }}
+              disabled={!isConnected || isScanning || isInitializing}
+              className="px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm disabled:opacity-50"
+            >
+              🧪 服务端CELLSCAN
+            </button>
+
+            {/* 诊断网络状态 */}
+            <button
+              onClick={async () => {
+                if (!socket) {
+                  alert('Socket未连接');
+                  return;
+                }
+                
+                console.log('🔍 诊断网络状态...');
+                
+                try {
+                  // 检查当前网络状态
+                  console.log('📡 检查当前网络状态');
+                  const copsResponse = await new Promise<any>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT+COPS?', (response: any) => {
+                      if (response.success) {
+                        resolve(response);
+                      } else {
+                        reject(new Error(response.error || 'COPS查询失败'));
+                      }
+                    });
+                  });
+                  
+                  // 检查信号状态
+                  console.log('📶 检查信号状态');
+                  const signalResponse = await new Promise<any>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT^HCSQ?', (response: any) => {
+                      if (response.success) {
+                        resolve(response);
+                      } else {
+                        reject(new Error(response.error || '信号查询失败'));
+                      }
+                    });
+                  });
+                  
+                  // 检查频率锁定状态
+                  console.log('🔒 检查频率锁定状态');
+                  const freqResponse = await new Promise<any>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT^NRFREQLOCK?', (response: any) => {
+                      if (response.success) {
+                        resolve(response);
+                      } else {
+                        reject(new Error(response.error || '频率锁定查询失败'));
+                      }
+                    });
+                  });
+                  
+                  const diagnosticInfo = `网络诊断结果:\n\n` +
+                    `1. 网络状态 (AT+COPS?):\n${copsResponse.data.response}\n\n` +
+                    `2. 信号状态 (AT^HCSQ?):\n${signalResponse.data.response}\n\n` +
+                    `3. 频率锁定 (AT^NRFREQLOCK?):\n${freqResponse.data.response}\n\n` +
+                    `分析:\n` +
+                    `- 如果COPS显示已连接网络，需要先执行AT+COPS=2断开\n` +
+                    `- 如果NRFREQLOCK不是0，需要先解锁\n` +
+                    `- 信号强度会影响扫描结果`;
+                  
+                  alert(diagnosticInfo);
+                  
+                } catch (error) {
+                  console.error('🔍 网络诊断失败:', error);
+                  alert(`网络诊断失败:\n${error instanceof Error ? error.message : '未知错误'}`);
+                }
+              }}
+              disabled={!isConnected || isScanning || isInitializing}
+              className="px-3 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 text-sm disabled:opacity-50"
+            >
+              🔍 诊断网络状态
+            </button>
+            <button
+              onClick={async () => {
+                if (!socket) {
+                  alert('Socket未连接');
+                  return;
+                }
+                
+                console.log('🧪 测试AT^CELLSCAN=3命令...');
+                try {
+                  const response = await new Promise<any>((resolve, reject) => {
+                    socket.emit('sendCommand', 'AT^CELLSCAN=3', (response: any) => {
+                      if (response.success) {
+                        resolve(response);
+                      } else {
+                        reject(new Error(response.error || 'CELLSCAN命令执行失败'));
+                      }
+                    });
+                  });
+                  
+                  console.log('🧪 CELLSCAN响应:', response);
+                  const responseText = response.data.response;
+                  const cellCount = (responseText.match(/\^CELLSCAN:/g) || []).length;
+                  
+                  alert(`CELLSCAN测试结果:\n\n发现 ${cellCount} 个小区信息\n\n响应内容:\n${responseText.substring(0, 500)}${responseText.length > 500 ? '...' : ''}`);
+                } catch (error) {
+                  console.error('🧪 CELLSCAN测试失败:', error);
+                  alert(`CELLSCAN测试失败:\n${error instanceof Error ? error.message : '未知错误'}`);
+                }
+              }}
+              disabled={!isConnected || isScanning || isInitializing}
+              className="px-3 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm disabled:opacity-50"
+            >
+              🧪 测试CELLSCAN
+            </button>
+
+            {scanResults.length > 0 && (
+              <>
+                <button
+                  onClick={handleExportResults}
+                  className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 flex items-center space-x-2"
+                >
+                  <span>📥</span>
+                  <span>导出结果</span>
+                </button>
+
+                <button
+                  onClick={handleClearResults}
+                  className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 flex items-center space-x-2"
+                >
+                  <span>🗑️</span>
+                  <span>清空结果</span>
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* 扫描进度 */}
+        {scanProgress && (
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                {scanProgress.stage === 'init' ? '🔧 初始化配置' : '🔍 小区扫描'}: {scanProgress.message}
+              </span>
+              <span className="text-sm text-gray-500 dark:text-gray-400">
+                {scanProgress.progress}%
+              </span>
+            </div>
+            <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3">
+              <div
+                className={`h-3 rounded-full transition-all duration-300 ${
+                  scanProgress.stage === 'init' 
+                    ? scanProgress.progress === 100 
+                      ? 'bg-green-600' 
+                      : 'bg-blue-600'
+                    : 'bg-green-600'
+                }`}
+                style={{ width: `${scanProgress.progress}%` }}
+              ></div>
+            </div>
+            
+            {/* 初始化配置的详细状态 */}
+            {scanProgress.stage === 'init' && (
+              <div className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+                {scanProgress.progress === 100 ? (
+                  <div className="flex items-center text-green-600">
+                    <span className="mr-1">✅</span>
+                    <span>所有配置命令执行完成</span>
+                  </div>
+                ) : scanProgress.progress > 0 ? (
+                  <div className="space-y-1">
+                    <div>正在执行以下命令序列：</div>
+                    <div className="ml-2 space-y-1 font-mono text-xs">
+                      <div className={scanProgress.progress >= 25 ? 'text-green-600' : 'text-gray-500'}>
+                        {scanProgress.progress >= 25 ? '✅' : '⏳'} AT^C5GOPTION=1,1,1
+                        {scanProgress.message.includes('C5GOPTION') && scanProgress.message.includes('重试') && (
+                          <span className="text-yellow-600 ml-2">🔄 重试中...</span>
+                        )}
+                      </div>
+                      <div className={scanProgress.progress >= 50 ? 'text-green-600' : 'text-gray-500'}>
+                        {scanProgress.progress >= 50 ? '✅' : '⏳'} AT^LTEFREQLOCK=0
+                        {scanProgress.message.includes('LTEFREQLOCK') && scanProgress.message.includes('重试') && (
+                          <span className="text-yellow-600 ml-2">🔄 重试中...</span>
+                        )}
+                      </div>
+                      <div className={scanProgress.progress >= 75 ? 'text-green-600' : 'text-gray-500'}>
+                        {scanProgress.progress >= 75 ? '✅' : '⏳'} AT^NRFREQLOCK=0
+                        {scanProgress.message.includes('NRFREQLOCK') && scanProgress.message.includes('重试') && (
+                          <span className="text-yellow-600 ml-2">🔄 重试中...</span>
+                        )}
+                      </div>
+                      <div className={scanProgress.progress >= 100 ? 'text-green-600' : 'text-gray-500'}>
+                        {scanProgress.progress >= 100 ? '✅' : '⏳'} AT^SYSCFGEX="0803",3FFFFFFF,1,2,7FFFFFFFFFFFFFFF,,
+                        {scanProgress.message.includes('SYSCFGEX') && scanProgress.message.includes('重试') && (
+                          <span className="text-yellow-600 ml-2">🔄 重试中...</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div>准备执行初始化配置命令...</div>
+                )}
+                
+                {/* 显示当前执行的命令和重试信息 */}
+                {scanProgress.message.includes('重试') && (
+                  <div className="mt-2 p-2 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded text-yellow-700 dark:text-yellow-300 text-xs">
+                    <div className="flex items-center">
+                      <span className="mr-1">🔄</span>
+                      <span>命令执行失败，正在重试...</span>
+                    </div>
+                    <div className="text-xs opacity-75 mt-1">
+                      参考Python版本逻辑：如果命令未返回OK，将自动重试最多3次
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 错误信息 */}
+        {error && (
+          <div className="mb-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+            <div className="flex items-center">
+              <span className="text-red-500 text-xl mr-3">⚠️</span>
+              <div>
+                <div className="text-red-700 dark:text-red-300 font-medium">扫描失败</div>
+                <div className="text-red-600 dark:text-red-400 text-sm mt-1">{error}</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 扫描说明 */}
+        <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
+          <div className="flex items-start">
+            <span className="text-blue-500 text-xl mr-3">ℹ️</span>
+            <div>
+              <div className="text-blue-700 dark:text-blue-300 font-medium">扫描说明</div>
+              <div className="text-blue-600 dark:text-blue-400 text-sm mt-1">
+                <ul className="list-disc list-inside space-y-1">
+                  <li className={isInitialized ? 'line-through opacity-60' : 'font-semibold'}>
+                    {isInitialized ? '✅ 已完成' : '⚠️ 必须'} 首次使用请先执行"初始化配置"
+                  </li>
+                  <li>初始化配置会依次执行4个AT命令，大约需要5-10秒</li>
+                  <li>小区扫描需要1-2分钟时间，请耐心等待</li>
+                  <li>扫描过程中会重启5G芯片，可能会短暂断网</li>
+                  <li>扫描完成后会自动恢复网络连接</li>
+                </ul>
+              </div>
+              
+              {isInitialized && (
+                <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded text-green-700 dark:text-green-300 text-sm">
+                  <div className="flex items-center">
+                    <span className="mr-2">✅</span>
+                    <span>初始化配置已完成，可以开始小区扫描</span>
+                  </div>
+                  {lastInitTime && (
+                    <div className="text-xs opacity-75 mt-1">
+                      初始化时间: {lastInitTime}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 扫描结果 */}
+      {scanResults.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+              扫描结果 ({scanResults.length} 个小区)
+            </h2>
+            {lastScanTime && (
+              <span className="text-sm text-gray-500 dark:text-gray-400">
+                扫描时间: {lastScanTime}
+              </span>
+            )}
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+              <thead className="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('rat')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>网络类型</span>
+                      {getSortIcon('rat')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('plmn')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>PLMN</span>
+                      {getSortIcon('plmn')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('freq')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>频率 (kHz)</span>
+                      {getSortIcon('freq')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('pci')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>PCI</span>
+                      {getSortIcon('pci')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('band')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>频段</span>
+                      {getSortIcon('band')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('rsrp')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>RSRP (dBm)</span>
+                      {getSortIcon('rsrp')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('rsrq')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>RSRQ (dB)</span>
+                      {getSortIcon('rsrq')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('sinr')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>SINR (dB)</span>
+                      {getSortIcon('sinr')}
+                    </div>
+                  </th>
+                  <th 
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
+                    onClick={() => handleSort('scs')}
+                  >
+                    <div className="flex items-center space-x-1">
+                      <span>SCS (kHz)</span>
+                      {getSortIcon('scs')}
+                    </div>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                {getSortedResults().map((result, index) => (
+                  <tr key={index} className="hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center">
+                        <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                          result.rat === 'NR' ? 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200' :
+                          result.rat === 'LTE' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                          'bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200'
+                        }`}>
+                          {result.rat}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.plmn || 'N/A'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.freq.toLocaleString()}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.pci}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.band}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`text-sm font-medium ${getSignalColor(result.rsrp)}`}>
+                        {result.rsrp}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.rsrq.toFixed(1)}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.sinr.toFixed(1)}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {result.scs}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* 空状态 */}
+      {scanResults.length === 0 && !isScanning && !isInitializing && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-12">
+          <div className="text-center">
+            <div className="text-6xl mb-4">🔍</div>
+            <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
+              暂无扫描结果
+            </h3>
+            <p className="text-gray-500 dark:text-gray-400 mb-6">
+              点击"开始扫描"按钮开始搜索周围的小区信息
+            </p>
+            <button
+              onClick={handleStartScan}
+              disabled={!isConnected}
+              className="px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2 mx-auto"
+            >
+              <span>🔍</span>
+              <span>开始扫描</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

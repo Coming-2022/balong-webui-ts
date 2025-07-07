@@ -1,0 +1,214 @@
+import type { Server } from 'socket.io';
+import { ATClient } from '../services/ATClient';
+import { DeviceMonitor } from '../services/DeviceMonitor';
+import { logger, logATCommand } from '../utils/logger';
+import { AT_COMMANDS } from '../config';
+
+import type { 
+  ServerToClientEvents, 
+  ClientToServerEvents,
+  APIResponse
+, ScanCompleteData} from '../../types';
+
+// 小区扫描状态管理
+let cellScanInProgress = false;
+let cellScanResults: any[] = [];
+
+// 解析小区扫描响应
+const parseCellScanResponse = (response: string) => {
+  const results: any[] = [];
+  const lines = response.split('\n');
+  
+  for (const line of lines) {
+    if (line.startsWith('^CELLSCAN: ')) {
+      try {
+        const data = line.split(': ', 2)[1];
+        const fields = data.split(',');
+        
+        if (fields.length >= 15) { // 确保有足够的字段
+          const rat = parseInt(fields[0]);
+          let ratStr = 'Unknown';
+          
+          switch (rat) {
+            case 1: ratStr = 'UMTS (FDD)'; break;
+            case 2: ratStr = 'LTE'; break;
+            case 3: ratStr = 'NR'; break;
+          }
+          
+          // 根据Python代码的正确字段索引
+          const record = {
+            rat: ratStr,
+            plmn: fields[1]?.replace(/"/g, '') || '',
+            freq: parseInt(fields[2]) || 0,
+            pci: parseInt(fields[3]) || 0,
+            band: parseInt(fields[4], 16) || 0,
+            lac: parseInt(fields[5], 16) || 0,
+            scs: getSCSValue(parseInt(fields[10]) || 0),
+            rsrp: parseInt(fields[11]) || 0,  // 正确的RSRP字段
+            rsrq: fields[12] ? parseInt(fields[12]) * 0.5 : 0,  // 正确的RSRQ字段，需要乘以0.5
+            sinr: fields[13] ? parseInt(fields[13]) * 0.5 : 0,  // 正确的SINR字段，需要乘以0.5
+            lte_sinr: fields[14] ? parseInt(fields[14], 16) * 0.125 : 0,  // LTE SINR字段，需要乘以0.125
+            timestamp: new Date().toISOString()
+          };
+          
+          results.push(record);
+        }
+      } catch (error) {
+        logger.warn(`解析小区扫描行失败: ${line}`, error);
+      }
+    }
+  }
+  
+  return results;
+};
+
+// SCS值映射函数
+const getSCSValue = (scs: number): string => {
+  const scsMap: { [key: number]: string } = {
+    0: '15',
+    1: '30',
+    2: '60',
+    3: '120',
+    4: '240'
+  };
+  return scsMap[scs] || '15';
+};
+
+export function setupSocketHandlers(
+  io: Server<ClientToServerEvents, ServerToClientEvents>,
+  atClient: ATClient,
+  deviceMonitor: DeviceMonitor
+): void {
+  
+  io.on('connection', (socket) => {
+    const clientId = socket.id;
+    const clientIP = socket.handshake.address;
+    
+    logger.info('客户端连接', { clientId, clientIP });
+
+    // 发送当前设备状态
+    const currentData = deviceMonitor.getCurrentData();
+    socket.emit('deviceUpdate', {
+      connected: atClient.connected,
+      signal: currentData.signal || undefined,
+      temperature: currentData.temperature || undefined,
+      nrccStatus: currentData.nrccStatus || undefined,
+      lockStatus: currentData.lockStatus || undefined,
+      monitoring: currentData.monitoring
+    });
+
+    // 处理AT命令发送
+    socket.on('sendCommand', async (command: string, callback) => {
+      try {
+        if (!command || typeof command !== 'string') {
+          callback({
+          success: true,
+          message: `扫描完成，发现 ${results.length} 个小区`,
+          data: {
+            count: results.length,
+            results: results
+          },
+          timestamp: new Date().toISOString()
+        });
+            
+            // 使用更长的超时时间，避免阻塞
+            const restoreResponse = await atClient.sendCommand('AT+COPS=0', 15000);
+            if (restoreResponse.includes('OK')) {
+              logger.info('网络连接已恢复');
+              socket.emit('scanProgress', { 
+                stage: 'scan', 
+                message: '网络连接已恢复', 
+                progress: 100 
+              });
+            } else {
+              logger.warn('网络恢复可能失败，但不影响扫描结果');
+            }
+          } catch (restoreError) {
+            logger.warn('网络恢复失败，但扫描结果已成功返回:', restoreError);
+            // 不抛出错误，因为扫描结果已经成功返回
+          } finally {
+            cellScanInProgress = false;
+          }
+        });
+
+        // 立即响应成功
+        callback({
+          success: true,
+          message: `扫描完成，发现 ${results.length} 个小区`,
+          count: results.length,
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        logger.error('小区扫描失败:', error);
+        
+        socket.emit('scanError', {
+          stage: 'scan',
+          message: '小区扫描失败',
+          error: error instanceof Error ? error.message : '未知错误'
+        });
+
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '小区扫描失败',
+          timestamp: new Date().toISOString()
+        });
+      } finally {
+        cellScanInProgress = false;
+      }
+    });
+
+    // 获取扫描状态
+    socket.on('getScanStatus', (callback) => {
+      callback({
+        success: true,
+        data: {
+          inProgress: cellScanInProgress,
+          results: cellScanResults,
+          count: cellScanResults.length
+        },
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // 启用/禁用监控
+    socket.on('enableMonitoring', (enabled: boolean) => {
+      try {
+        if (enabled) {
+          deviceMonitor.start();
+          logger.info('客户端启用设备监控', { clientId });
+        } else {
+          deviceMonitor.stop();
+          logger.info('客户端禁用设备监控', { clientId });
+        }
+        
+        socket.emit('deviceUpdate', { monitoring: enabled });
+        
+      } catch (error) {
+        socket.emit('error', error instanceof Error ? error.message : '监控状态切换失败');
+      }
+    });
+
+    // 客户端断开连接
+    socket.on('disconnect', (reason) => {
+      logger.info('客户端断开连接', { clientId, reason });
+    });
+
+    // 错误处理
+    socket.on('error', (error) => {
+      logger.error('Socket错误', { clientId, error });
+    });
+  });
+
+  // 全局错误处理
+  io.engine.on('connection_error', (err) => {
+    logger.error('Socket.IO连接错误', {
+      code: err.code,
+      message: err.message,
+      context: err.context,
+      type: err.type
+    });
+  });
+
+  logger.info('Socket.IO事件处理器已设置完成');
+}

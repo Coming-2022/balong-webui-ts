@@ -1,0 +1,923 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useSocket } from '../hooks/useSocket';
+import SignalChart from '../components/SignalChart';
+
+interface SignalData {
+  sysmode: string;
+  rsrp: number | string;
+  rsrq: number | string;
+  sinr: string;
+  rssi?: number | string;
+  timestamp: string;
+}
+
+interface SignalHistoryPoint {
+  timestamp: string;
+  rsrp: number | null;
+  rsrq: number | null;
+  sinr: number | null;
+  rssi: number | null;
+}
+
+interface NRCCData {
+  nr_count: number;
+  lte_count: number;
+  nr_records: any[];
+  lte_records: any[];
+  aggregationType?: string;  // 载波聚合类型
+  aggregationInfo?: string;  // 载波聚合描述
+  totalCarriers?: number;    // 总载波数量
+  carrier_details?: any[];
+}
+
+interface SignalHistory {
+  timestamp: Date;
+  rsrp: number | null;
+  rsrq: number | null;
+  sinr: number | null;
+}
+
+export default function SignalMonitor() {
+  const [signalData, setSignalData] = useState<SignalData | null>(null);
+  const [nrccData, setNRCCData] = useState<NRCCData | null>(null);
+  const [signalHistory, setSignalHistory] = useState<SignalHistory[]>([]);
+  const [signalHistoryChart, setSignalHistoryChart] = useState<SignalHistoryPoint[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [refreshInterval, setRefreshInterval] = useState(10000);
+  const [error, setError] = useState<string | null>(null);
+  
+  const { sendCommand, isConnected } = useSocket();
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // 获取信号数据
+  const fetchSignalData = async () => {
+    try {
+      setError(null);
+      const response = await sendCommand('AT^HCSQ?');
+      const responseText = response.data?.response || '';
+      
+      if (responseText.includes('^HCSQ:')) {
+        const data = responseText.split('^HCSQ:')[1].split('\r\n')[0];
+        const fields = data.trim().replace(/"/g, '').split(',');
+        
+        if (fields.length >= 4) {
+          const [sysmode, rsrp, sinr, rsrq] = fields;
+          
+          const parsedData: SignalData = {
+            sysmode: sysmode.trim(),
+            rsrp: rsrp === '255' ? '未知或不可测' : -140 + parseInt(rsrp),
+            rsrq: rsrq === '255' ? '未知或不可测' : 
+                  rsrq === '34' ? '≥ -3 dB' : -19.5 + parseInt(rsrq) * 0.5,
+            sinr: sinr === '255' ? '未知或不可测' :
+                  sinr === '251' ? '≥ 30.0 dB' : `${(-20 + parseInt(sinr) * 0.2).toFixed(1)} dB`,
+            rssi: undefined, // 可以从其他命令获取
+            timestamp: new Date().toLocaleString()
+          };
+          
+          setSignalData(parsedData);
+          
+          // 添加到历史记录
+          const historyEntry: SignalHistory = {
+            timestamp: new Date(),
+            rsrp: typeof parsedData.rsrp === 'number' ? parsedData.rsrp : null,
+            rsrq: typeof parsedData.rsrq === 'number' ? parsedData.rsrq : null,
+            sinr: parseSINR(parsedData.sinr)
+          };
+          
+          setSignalHistory(prev => [...prev.slice(-49), historyEntry]);
+          
+          // 添加到图表数据
+          const chartEntry: SignalHistoryPoint = {
+            timestamp: new Date().toISOString(),
+            rsrp: typeof parsedData.rsrp === 'number' ? parsedData.rsrp : null,
+            rsrq: typeof parsedData.rsrq === 'number' ? parsedData.rsrq : null,
+            sinr: parseSINR(parsedData.sinr),
+            rssi: typeof parsedData.rssi === 'number' ? parsedData.rssi : null
+          };
+          
+          setSignalHistoryChart(prev => {
+            const newHistory = [...prev, chartEntry];
+            // 保留最近100个数据点
+            return newHistory.slice(-100);
+          });
+        }
+      }
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '获取信号数据失败');
+    }
+  };
+
+  // 🔧 修复: 获取5G状态 - 使用统一的5G状态API端点
+  const fetch5GStatus = async () => {
+    try {
+      console.log('🔄 刷新5G状态数据...');
+      
+      // 使用修复后的5G状态API端点
+      const response = await fetch('/api/5g-status', {
+        method: 'GET',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        credentials: 'include'
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      console.log('HFREQINFO响应:', result);
+
+      if (result.success && result.data) {
+        console.log('✅ 5G状态API响应成功:', result.data);
+        
+        // 🔧 修复: 使用API返回的标准格式数据
+        const apiData = result.data;
+        
+        // 直接使用API返回的解析后数据
+        setNRCCData({
+          nr_records: [],
+          lte_records: [],
+          nr_count: apiData.nr_count || 0,
+          lte_count: apiData.lte_count || 0,
+          aggregationType: apiData.nr_count > 0 ? 'NR' : (apiData.lte_count > 0 ? 'LTE' : 'None'),
+          aggregationInfo: apiData.bands ? apiData.bands.join(', ') : '无载波信息',
+          totalCarriers: (apiData.nr_count || 0) + (apiData.lte_count || 0),
+          mock: apiData.mock || false
+        });
+        
+        // 清除错误状态
+        if (apiData.mock) {
+          setError('使用模拟5G状态数据 - 设备可能未连接');
+        } else {
+          setError(null);
+        }
+        
+        console.log('✅ 5G状态数据已更新');
+        return; // 成功处理，直接返回
+        
+        // 以下是原始解析逻辑的备份（如果API数据格式不符合预期）
+        if (false) { // 禁用原始解析逻辑
+          const data = responseText.split('^HFREQINFO:')[1].split('\r\nOK\r\n')[0];
+          const records = data.split(',');
+          
+          console.log('分割后的记录:', records);
+          
+          // 取出前两个字段作为 proa 和 sysmode
+          const [proa, sysmode] = records.slice(0, 2).map(Number);
+          const carrierData = records.slice(2);
+          
+          console.log('解析参数:', { proa, sysmode, carrierData });
+
+          const nr_records: any[] = [];
+          const lte_records: any[] = [];
+
+          // 按照7个字段一组解析载波数据 - 修复逻辑
+          for (let i = 0; i < carrierData.length; i += 7) {
+            if (i + 6 < carrierData.length) {
+              const [band_class, dl_fcn, dl_freq, dl_bw, ul_fcn, ul_freq, ul_bw] = 
+                carrierData.slice(i, i + 7);
+
+              const record = {
+                proa,
+                band_class,
+                dl_fcn,
+                dl_freq,
+                dl_bw,
+                ul_fcn,
+                ul_freq,
+                ul_bw
+              };
+
+              console.log(`载波 ${i/7 + 1}:`, record);
+
+              // 根据全局sysmode判断载波类型 - 修复关键逻辑
+              if (sysmode === 7) {
+                // 所有载波都是NR类型
+                nr_records.push({
+                  ...record,
+                  sysmode: 'NR'
+                });
+              } else if (sysmode === 6) {
+                // 所有载波都是LTE类型
+                lte_records.push({
+                  ...record,
+                  sysmode: 'LTE'
+                });
+              }
+            }
+          }
+
+          // 载波聚合判断逻辑
+          const nr_count = nr_records.length;
+          const lte_count = lte_records.length;
+          
+          let aggregationType = 'None';
+          let aggregationInfo = '';
+          
+          if (nr_count > 1) {
+            aggregationType = 'NR-CA';
+            aggregationInfo = `${nr_count}CC NR载波聚合`;
+          } else if (lte_count > 1) {
+            aggregationType = 'LTE-CA';
+            aggregationInfo = `${lte_count}CC LTE载波聚合`;
+          } else if (nr_count === 1 && lte_count === 1) {
+            aggregationType = 'EN-DC';
+            aggregationInfo = 'NR-LTE双连接';
+          } else if (nr_count === 1) {
+            aggregationType = 'NR-SA';
+            aggregationInfo = '单载波NR';
+          } else if (lte_count === 1) {
+            aggregationType = 'LTE-SA';
+            aggregationInfo = '单载波LTE';
+          }
+
+          console.log('载波聚合分析:', { aggregationType, aggregationInfo, nr_count, lte_count });
+
+          setNRCCData({
+            nr_records,
+            lte_records,
+            nr_count,
+            lte_count,
+            aggregationType,
+            aggregationInfo,
+            totalCarriers: nr_count + lte_count
+          });
+          
+        } else {
+          // 🔧 修复: 即使没有找到HFREQINFO，也使用返回的数据
+          console.log('⚠️ 使用API返回的数据（可能是模拟数据）');
+          
+          // 使用API返回的数据或默认值
+          const apiData = result.data || {};
+          setNRCCData({
+            nr_records: [],
+            lte_records: [],
+            nr_count: apiData.nr_count || 0,
+            lte_count: apiData.lte_count || 0,
+            aggregationType: apiData.nr_count > 0 ? 'NR' : (apiData.lte_count > 0 ? 'LTE' : 'None'),
+            aggregationInfo: apiData.bands ? apiData.bands.join(', ') : '无载波信息',
+            totalCarriers: (apiData.nr_count || 0) + (apiData.lte_count || 0),
+            mock: apiData.mock || false
+          });
+          
+          // 如果是模拟数据，显示提示而不是错误
+          if (apiData.mock) {
+            setError('使用模拟5G状态数据 - 设备可能未连接');
+          } else {
+            setError(null); // 清除错误
+          }
+          return; // 成功处理，不抛出错误
+        }
+      } else {
+        // 🔧 修复: 改善错误处理
+        console.log('⚠️ API返回失败，但尝试使用返回的数据');
+        
+        // 即使API返回失败，也尝试使用可能存在的数据
+        const apiData = result.data || {};
+        if (apiData.nr_count !== undefined || apiData.lte_count !== undefined) {
+          setNRCCData({
+            nr_records: [],
+            lte_records: [],
+            nr_count: apiData.nr_count || 0,
+            lte_count: apiData.lte_count || 0,
+            aggregationType: apiData.nr_count > 0 ? 'NR' : (apiData.lte_count > 0 ? 'LTE' : 'None'),
+            aggregationInfo: apiData.bands ? apiData.bands.join(', ') : '无载波信息',
+            totalCarriers: (apiData.nr_count || 0) + (apiData.lte_count || 0),
+            mock: apiData.mock || false
+          });
+          
+          if (apiData.mock) {
+            setError('使用模拟5G状态数据 - 设备可能未连接');
+          } else {
+            setError(null);
+          }
+          return;
+        }
+        
+        throw new Error(result.error || '获取5G状态失败');
+      }
+    } catch (error) {
+      console.error('获取5G状态失败:', error);
+      
+      // 设置错误状态但保持基本功能
+      setNRCCData({
+        nr_records: [],
+        lte_records: [],
+        nr_count: 0,
+        lte_count: 0,
+        aggregationType: 'None',
+        aggregationInfo: nrccData.mock ? '无载波信息 (模拟数据)' : '无载波信息',
+        totalCarriers: 0
+      });
+      
+      // 显示错误信息
+      setError(`5G状态获取失败: ${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  };
+
+  // 清空历史数据
+  const clearHistory = () => {
+    setSignalHistory([]);
+    setSignalHistoryChart([]);
+  };
+
+  // 导出历史数据
+  const exportHistory = () => {
+    if (signalHistoryChart.length === 0) return;
+    
+    let content = 'MT5700M 信号历史数据\n';
+    content += `导出时间: ${new Date().toLocaleString()}\n`;
+    content += '='.repeat(50) + '\n\n';
+    content += '时间,RSRP(dBm),RSRQ(dB),SINR(dB),RSSI(dBm)\n';
+    
+    signalHistoryChart.forEach(point => {
+      content += `"${new Date(point.timestamp).toLocaleString()}",${point.rsrp || 'N/A'},${point.rsrq || 'N/A'},${point.sinr || 'N/A'},${point.rssi || 'N/A'}\n`;
+    });
+    
+    const blob = new Blob([content], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mt5700m_signal_history_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 🔧 修复: 刷新所有数据 - 改善错误处理和日志
+  const refreshAll = async () => {
+    console.log('🔄 开始刷新所有数据...');
+    setIsLoading(true);
+    setError(null); // 清除之前的错误
+    
+    try {
+      // 并行获取信号数据和5G状态
+      const [signalResult, fiveGResult] = await Promise.allSettled([
+        fetchSignalData(),
+        fetch5GStatus()
+      ]);
+      
+      // 检查结果
+      if (signalResult.status === 'fulfilled') {
+        console.log('✅ 信号数据刷新成功');
+      } else {
+        console.error('❌ 信号数据刷新失败:', signalResult.reason);
+      }
+      
+      if (fiveGResult.status === 'fulfilled') {
+        console.log('✅ 5G状态数据刷新成功');
+      } else {
+        console.error('❌ 5G状态数据刷新失败:', fiveGResult.reason);
+      }
+      
+      console.log('🎉 数据刷新完成');
+      
+    } catch (error) {
+      console.error('❌ 刷新数据时发生错误:', error);
+      setError('数据刷新失败，请重试');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // 解析SINR值
+  const parseSINR = (sinr: string): number | null => {
+    if (typeof sinr === 'string') {
+      const match = sinr.match(/([-\d.]+)/);
+      return match ? parseFloat(match[1]) : null;
+    }
+    return null;
+  };
+
+  // 获取信号质量等级
+  const getSignalQuality = (value: number | string, type: 'rsrp' | 'rsrq' | 'sinr') => {
+    if (typeof value !== 'number') return 'unknown';
+    
+    switch (type) {
+      case 'rsrp':
+        if (value >= -80) return 'excellent';
+        if (value >= -100) return 'good';
+        return 'poor';
+      case 'rsrq':
+        if (value >= -10) return 'excellent';
+        if (value >= -15) return 'good';
+        return 'poor';
+      case 'sinr':
+        if (value >= 20) return 'excellent';
+        if (value >= 10) return 'good';
+        return 'poor';
+      default:
+        return 'unknown';
+    }
+  };
+
+  // 获取信号质量颜色
+  const getQualityColor = (quality: string) => {
+    switch (quality) {
+      case 'excellent': return 'text-green-500';
+      case 'good': return 'text-yellow-500';
+      case 'poor': return 'text-red-500';
+      default: return 'text-gray-500';
+    }
+  };
+
+  // 获取信号强度百分比
+  const getSignalPercentage = (value: number | string, type: 'rsrp' | 'rsrq' | 'sinr') => {
+    if (typeof value !== 'number') return 0;
+    
+    switch (type) {
+      case 'rsrp':
+        return Math.min(Math.max(((value + 140) / 96) * 100, 0), 100);
+      case 'rsrq':
+        return Math.min(Math.max(((value + 19.5) / 16.5) * 100, 0), 100);
+      case 'sinr':
+        return Math.min(Math.max(((value + 20) / 50) * 100, 0), 100);
+      default:
+        return 0;
+    }
+  };
+
+  // 自动刷新控制
+  useEffect(() => {
+    if (autoRefresh && isConnected) {
+      intervalRef.current = setInterval(refreshAll, refreshInterval);
+      return () => {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+        }
+      };
+    } else if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+    }
+  }, [autoRefresh, refreshInterval, isConnected]);
+
+  // 页面加载时获取数据
+  useEffect(() => {
+    if (isConnected) {
+      refreshAll();
+    }
+  }, [isConnected]);
+
+  return (
+    <div className="max-w-6xl mx-auto space-y-6">
+      {/* 页面标题 */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center">
+              📶 信号监控
+            </h1>
+            <p className="text-gray-600 dark:text-gray-300 mt-1">
+              实时监控5G/LTE信号强度和质量
+            </p>
+          </div>
+          <div className="flex items-center space-x-4">
+            <div className="flex items-center space-x-2">
+              <label className="flex items-center space-x-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                  className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="text-sm text-gray-700 dark:text-gray-300">
+                  自动刷新 ({refreshInterval / 1000}s)
+                </span>
+              </label>
+            </div>
+            <button
+                            onClick={() => {
+                console.log('🔄 用户点击立即刷新按钮');
+                refreshAll();
+              }}
+              disabled={isLoading || !isConnected}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+            >
+              {isLoading ? (
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <span>🔄</span>
+              )}
+              <span>立即刷新</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+          <div className="flex items-center">
+            <span className="text-red-500 mr-2">⚠️</span>
+            <span className="text-red-700 dark:text-red-300">{error}</span>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* 信号强度卡片 */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center">
+            📡 信号强度
+          </h2>
+          
+          {signalData ? (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">系统模式:</span>
+                <span className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded text-sm">
+                  {signalData.sysmode}
+                </span>
+              </div>
+              
+              {/* RSRP */}
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-sm text-gray-600 dark:text-gray-400">RSRP (参考信号接收功率)</span>
+                  <span className={`font-bold ${getQualityColor(getSignalQuality(signalData.rsrp, 'rsrp'))}`}>
+                    {typeof signalData.rsrp === 'number' ? `${signalData.rsrp} dBm` : signalData.rsrp}
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all duration-300 ${
+                      getSignalQuality(signalData.rsrp, 'rsrp') === 'excellent' ? 'bg-green-500' :
+                      getSignalQuality(signalData.rsrp, 'rsrp') === 'good' ? 'bg-yellow-500' : 'bg-red-500'
+                    }`}
+                    style={{ width: `${getSignalPercentage(signalData.rsrp, 'rsrp')}%` )
+                  ></div>
+                </div>
+                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                  <span>-140 dBm</span>
+                  <span>-44 dBm</span>
+                </div>
+              </div>
+              
+              {/* RSRQ */}
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-sm text-gray-600 dark:text-gray-400">RSRQ (参考信号接收质量)</span>
+                  <span className={`font-bold ${getQualityColor(getSignalQuality(signalData.rsrq, 'rsrq'))}`}>
+                    {typeof signalData.rsrq === 'number' ? `${signalData.rsrq} dB` : signalData.rsrq}
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all duration-300 ${
+                      getSignalQuality(signalData.rsrq, 'rsrq') === 'excellent' ? 'bg-green-500' :
+                      getSignalQuality(signalData.rsrq, 'rsrq') === 'good' ? 'bg-yellow-500' : 'bg-red-500'
+                    }`}
+                    style={{ width: `${getSignalPercentage(signalData.rsrq, 'rsrq')}%` )
+                  ></div>
+                </div>
+                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                  <span>-19.5 dB</span>
+                  <span>-3 dB</span>
+                </div>
+              </div>
+              
+              {/* SINR */}
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-sm text-gray-600 dark:text-gray-400">SINR (信号与干扰加噪声比)</span>
+                  <span className={`font-bold ${getQualityColor(getSignalQuality(parseSINR(signalData.sinr), 'sinr'))}`}>
+                    {signalData.sinr}
+                  </span>
+                </div>
+                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all duration-300 ${
+                      getSignalQuality(parseSINR(signalData.sinr), 'sinr') === 'excellent' ? 'bg-green-500' :
+                      getSignalQuality(parseSINR(signalData.sinr), 'sinr') === 'good' ? 'bg-yellow-500' : 'bg-red-500'
+                    }`}
+                    style={{ width: `${getSignalPercentage(parseSINR(signalData.sinr), 'sinr')}%` )
+                  ></div>
+                </div>
+                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                  <span>-20 dB</span>
+                  <span>30 dB</span>
+                </div>
+              </div>
+              
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-4">
+                最后更新: {signalData.timestamp}
+              </p>
+            </div>
+          ) : (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+              {isLoading ? '正在获取信号数据...' : '暂无信号数据'}
+            </div>
+          )}
+        </div>
+
+        {/* 5G NR CC状态 */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center">
+              📡 5G NR CC状态
+            </h2>
+            <button
+              onClick={fetch5GStatus}
+              disabled={isLoading || !isConnected}
+              className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-1"
+            >
+              <span>🔄</span>
+              <span>刷新</span>
+            </button>
+          </div>
+          
+          {error && (error.includes('5G状态获取失败') || error.includes('模拟5G状态数据')) && (
+            <div className="mb-4 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
+              <div className="flex items-center">
+                <span className="text-yellow-500 mr-2">⚠️</span>
+                <div className="flex-1">
+                  <span className="text-yellow-700 dark:text-yellow-300">{error}</span>
+                  <div className="mt-2">
+                    <button
+                      onClick={fetch5GStatus}
+                      disabled={isLoading}
+                      className="px-3 py-1 text-xs bg-yellow-600 text-white rounded hover:bg-yellow-700 disabled:opacity-50"
+                    >
+                      重试获取
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {nrccData ? (
+            <div className="space-y-4">
+              {/* 载波聚合状态显示 */}
+              {nrccData.aggregationInfo && (
+                <div className="bg-gradient-to-r from-blue-50 to-green-50 dark:from-blue-900/20 dark:to-green-900/20 p-4 rounded-lg border border-blue-200 dark:border-blue-700">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-semibold text-gray-900 dark:text-white">载波聚合状态</h3>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{nrccData.aggregationInfo}</p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-2xl font-bold text-purple-600">{nrccData.totalCarriers || (nrccData.nr_count + nrccData.lte_count)}</div>
+                      <div className="text-xs text-gray-500">总载波数</div>
+                    </div>
+                  </div>
+                  {nrccData.aggregationType && (
+                    <div className="mt-2">
+                      <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        nrccData.aggregationType === 'NR-CA' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400' :
+                        nrccData.aggregationType === 'LTE-CA' ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400' :
+                        nrccData.aggregationType === 'EN-DC' ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400' :
+                        'bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400'
+                      }`}>
+                        {nrccData.aggregationType}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              <div className="grid grid-cols-2 gap-4 text-center">
+                <div>
+                  <div className="text-3xl font-bold text-blue-600">{nrccData.nr_count}</div>
+                  <div className="text-sm text-gray-600 dark:text-gray-400">NR载波</div>
+                </div>
+                <div>
+                  <div className="text-3xl font-bold text-green-600">{nrccData.lte_count}</div>
+                  <div className="text-sm text-gray-600 dark:text-gray-400">LTE载波</div>
+                </div>
+              </div>
+              
+              {/* NR载波详情 */}
+              {nrccData.nr_records.length > 0 && (
+                <div className="space-y-2">
+                  <h3 className="font-medium text-gray-900 dark:text-white">NR载波详情:</h3>
+                  {nrccData.nr_records.map((record, index) => (
+                    <div key={index} className="bg-blue-50 dark:bg-blue-900/20 p-3 rounded-lg text-sm">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div><strong>频段:</strong> {record.band_class}</div>
+                        <div><strong>系统:</strong> {record.sysmode}</div>
+                        <div><strong>下行频率:</strong> {record.dl_freq} kHz</div>
+                        <div><strong>上行频率:</strong> {record.ul_freq} kHz</div>
+                        <div><strong>下行带宽:</strong> {record.dl_bw} MHz</div>
+                        <div><strong>上行带宽:</strong> {record.ul_bw} MHz</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {/* 🔧 新增: 载波状态详情 (参考系统概览) */}
+              {nrccData.carrier_details && nrccData.carrier_details.length > 0 && (
+                <div className="mt-4 space-y-2">
+                  <h3 className="font-medium text-gray-900 dark:text-white">载波状态详情:</h3>
+                  <div className="grid grid-cols-1 gap-2">
+                    {nrccData.carrier_details.map((carrier, index) => (
+                      <div key={index} className="bg-green-50 dark:bg-green-900/20 p-3 rounded-lg text-sm">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                          <div><strong>载波{index + 1}:</strong> n{carrier.band}</div>
+                          <div><strong>ARFCN:</strong> {carrier.arfcn}</div>
+                          <div><strong>频率:</strong> {(carrier.freq / 1000).toFixed(1)}MHz</div>
+                          <div><strong>带宽:</strong> {(carrier.bandwidth / 1000)}MHz</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              
+              {/* 🔧 新增: 频段汇总信息 */}
+              {nrccData.bands && nrccData.bands.length > 0 && (
+                <div className="mt-4">
+                  <h3 className="font-medium text-gray-900 dark:text-white mb-2">频段汇总:</h3>
+                  <div className="flex flex-wrap gap-2">
+                    {nrccData.bands.map((band, index) => (
+                      <span key={index} className="inline-flex px-3 py-1 text-sm font-medium rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400">
+                        {band}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))
+              
+              {/* LTE载波详情 */}
+              {nrccData.lte_records.length > 0 && (
+                <div className="space-y-2">
+                  <h3 className="font-medium text-gray-900 dark:text-white">LTE载波详情:</h3>
+                  {nrccData.lte_records.map((record, index) => (
+                    <div key={index} className="bg-green-50 dark:bg-green-900/20 p-3 rounded-lg text-sm">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div><strong>频段:</strong> {record.band_class}</div>
+                        <div><strong>系统:</strong> {record.sysmode}</div>
+                        <div><strong>下行频率:</strong> {record.dl_freq} kHz</div>
+                        <div><strong>上行频率:</strong> {record.ul_freq} kHz</div>
+                        <div><strong>下行带宽:</strong> {record.dl_bw} MHz</div>
+                        <div><strong>上行带宽:</strong> {record.ul_bw} MHz</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              
+              {/* 无载波时的提示 */}
+              {nrccData.nr_count === 0 && nrccData.lte_count === 0 && (
+                <div className="text-center py-4 text-gray-500 dark:text-gray-400">
+                  <div className="mb-2">📡</div>
+                  <div>未检测到活动载波</div>
+                  <div className="text-sm mt-2">
+                    <button
+                      onClick={fetch5GStatus}
+                      disabled={isLoading}
+                      className="text-blue-600 hover:text-blue-800 disabled:opacity-50"
+                    >
+                      点击重新检测
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+              {isLoading ? (
+                <div className="flex items-center justify-center">
+                  <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mr-3"></div>
+                  <span>正在获取5G状态...</span>
+                </div>
+              ) : (
+                <div>
+                  <div className="mb-2">📡</div>
+                  <div>暂无5G状态数据</div>
+                  <div className="text-sm mt-2">
+                    <button
+                      onClick={fetch5GStatus}
+                      disabled={!isConnected}
+                      className="text-blue-600 hover:text-blue-800 disabled:opacity-50"
+                    >
+                      点击获取数据
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 信号历史趋势 */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center">
+            📈 信号历史趋势
+          </h2>
+          <div className="flex items-center space-x-4">
+            <select
+              value={refreshInterval}
+              onChange={(e) => setRefreshInterval(Number(e.target.value))}
+              className="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
+            >
+              <option value={5000}>5秒</option>
+              <option value={10000}>10秒</option>
+              <option value={30000}>30秒</option>
+              <option value={60000}>1分钟</option>
+            </select>
+            
+            <button
+              onClick={exportHistory}
+              disabled={signalHistoryChart.length === 0}
+              className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-1"
+            >
+              <span>📥</span>
+              <span>导出</span>
+            </button>
+            
+            <button
+              onClick={clearHistory}
+              disabled={signalHistoryChart.length === 0}
+              className="px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-1"
+            >
+              <span>🗑️</span>
+              <span>清空</span>
+            </button>
+          </div>
+        </div>
+        
+        {signalHistoryChart.length > 0 ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
+              <span>显示最近 {signalHistoryChart.length} 条记录</span>
+              <div className="flex items-center space-x-4">
+                <div className="flex items-center space-x-1">
+                  <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
+                  <span>RSRP</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+                  <span>RSRQ</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-3 h-3 bg-yellow-500 rounded-full"></div>
+                  <span>SINR</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+                  <span>RSSI</span>
+                </div>
+              </div>
+            </div>
+            
+            {/* 信号趋势图表 */}
+            <div className="h-80">
+              <SignalChart data={signalHistoryChart} height={320} />
+            </div>
+            
+            {/* 最新数据摘要 */}
+            {signalHistoryChart.length > 0 && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+                <div className="text-center">
+                  <div className="text-lg font-semibold text-blue-600">
+                    {signalHistoryChart[signalHistoryChart.length - 1].rsrp || 'N/A'}
+                  </div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">最新RSRP (dBm)</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-semibold text-green-600">
+                    {signalHistoryChart[signalHistoryChart.length - 1].rsrq || 'N/A'}
+                  </div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">最新RSRQ (dB)</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-semibold text-yellow-600">
+                    {signalHistoryChart[signalHistoryChart.length - 1].sinr || 'N/A'}
+                  </div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">最新SINR (dB)</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-semibold text-red-600">
+                    {signalHistoryChart[signalHistoryChart.length - 1].rssi || 'N/A'}
+                  </div>
+                  <div className="text-sm text-gray-500 dark:text-gray-400">最新RSSI (dBm)</div>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-center py-12 text-gray-500 dark:text-gray-400">
+            <div className="text-4xl mb-4">📈</div>
+            <div className="text-lg mb-2">暂无历史数据</div>
+            <div className="text-sm">启用自动刷新开始收集信号数据</div>
+            <div className="mt-4">
+              <button
+                onClick={() => setAutoRefresh(true)}
+                disabled={!isConnected || autoRefresh}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {autoRefresh ? '自动刷新已启用' : '启用自动刷新'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

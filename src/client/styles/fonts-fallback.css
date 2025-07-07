@@ -1,0 +1,72 @@
+/* 字体回退方案 - 当网络字体加载失败时使用 */
+
+/* 主要字体栈 - 中文优先 */
+.font-sans {
+  font-family: 
+    /* 中文字体 */
+    "PingFang SC",
+    "Hiragino Sans GB", 
+    "Microsoft YaHei",
+    "WenQuanYi Micro Hei",
+    "Noto Sans CJK SC",
+    /* 英文字体 */
+    "Inter",
+    "SF Pro Display",
+    "-apple-system",
+    "BlinkMacSystemFont",
+    "Segoe UI",
+    "Roboto",
+    "Helvetica Neue",
+    "Arial",
+    sans-serif,
+    /* Emoji */
+    "Apple Color Emoji",
+    "Segoe UI Emoji";
+}
+
+/* 等宽字体栈 */
+.font-mono {
+  font-family:
+    /* 中文等宽字体 */
+    "SF Mono",
+    "Monaco",
+    "Inconsolata",
+    "Roboto Mono",
+    "Source Code Pro",
+    /* 系统等宽字体 */
+    "Consolas",
+    "Liberation Mono",
+    "Menlo",
+    "Courier",
+    monospace;
+}
+
+/* 确保中文字符正确显示 */
+:root {
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Inter", system-ui, sans-serif;
+  --font-mono: "SF Mono", "Monaco", "Consolas", monospace;
+}
+
+/* 针对不同操作系统的字体优化 */
+@media screen {
+  /* macOS */
+  @supports (-webkit-backdrop-filter: blur(1px)) {
+    .font-sans {
+      font-family: "PingFang SC", "Inter", "SF Pro Display", "-apple-system", sans-serif;
+    }
+  }
+  
+  /* Windows */
+  @media screen and (-ms-high-contrast: active), (-ms-high-contrast: none) {
+    .font-sans {
+      font-family: "Microsoft YaHei", "Inter", "Segoe UI", sans-serif;
+    }
+  }
+  
+  /* Linux */
+  @supports not (-webkit-backdrop-filter: blur(1px)) and not (-ms-high-contrast: active) {
+    .font-sans {
+      font-family: "Noto Sans CJK SC", "WenQuanYi Micro Hei", "Inter", "Roboto", sans-serif;
+    }
+  }
+}

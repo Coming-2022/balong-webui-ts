@@ -1,0 +1,323 @@
+import net from 'net';
+import { EventEmitter } from 'events';
+import { logger } from '../utils/logger';
+import { DeviceConfig, SocketConfig, SignalData, LockStatus, ChipTemperature, ScanResult } from '../../types';
+
+export class ATClient extends EventEmitter {
+  private tcpSocket: net.Socket | null = null;
+  private unixSocket: net.Socket | null = null;
+  private isConnected: boolean = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private deviceConfig: DeviceConfig;
+  private socketConfig: SocketConfig;
+
+  constructor(deviceConfig: DeviceConfig, socketConfig: SocketConfig) {
+    super();
+    this.deviceConfig = deviceConfig;
+    this.socketConfig = socketConfig;
+  }
+
+  public async initialize(): Promise<void> {
+    try {
+      await this.connectToDevice();
+      logger.info('AT客户端初始化成功');
+    } catch (error) {
+      logger.error('AT客户端初始化失败:', error);
+      throw error;
+    }
+  }
+
+  private async connectToDevice(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.tcpSocket = new net.Socket();
+      
+      this.tcpSocket.connect(this.deviceConfig.serverPort, this.deviceConfig.serverIp, () => {
+        this.isConnected = true;
+        logger.info(`已连接到设备 ${this.deviceConfig.serverIp}:${this.deviceConfig.serverPort}`);
+        resolve();
+      });
+
+      this.tcpSocket.on('error', (error) => {
+        logger.error('TCP连接错误:', error);
+        this.isConnected = false;
+        reject(error);
+      });
+
+      this.tcpSocket.on('close', () => {
+        logger.warn('TCP连接已关闭');
+        this.isConnected = false;
+      });
+    });
+  }
+
+  public async sendCommand(command: string, customTimeout?: number): Promise<string> {
+    if (!this.isConnected || !this.tcpSocket) {
+      throw new Error('设备未连接');
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeoutMs = customTimeout || (this.deviceConfig.timeout * 1000);
+      const timeout = setTimeout(() => {
+        reject(new Error(`命令执行超时 (${timeoutMs}ms): ${command}`));
+      }, timeoutMs);
+
+      let response = '';
+      
+      const onData = (data: Buffer) => {
+        response += data.toString();
+        
+        if (response.includes('OK') || response.includes('ERROR')) {
+          clearTimeout(timeout);
+          this.tcpSocket?.off('data', onData);
+          resolve(response);
+        }
+      };
+
+      this.tcpSocket!.on('data', onData);
+      this.tcpSocket!.write(command + '\r\n');
+      
+      logger.debug(`发送AT命令: ${command} (超时: ${timeoutMs}ms)`);
+    });
+  }
+
+  // 专门用于CELLSCAN的长时间命令执行
+  public async sendCellScanCommand(command: string, maxAttempts: number = 60): Promise<string> {
+    if (!this.isConnected || !this.tcpSocket) {
+      throw new Error('设备未连接');
+    }
+
+    logger.info(`开始执行CELLSCAN命令: ${command}, 最大尝试次数: ${maxAttempts}`);
+    
+    let fullResponse = '';
+    let attempts = 0;
+    let completed = false;
+
+    while (!completed && attempts < maxAttempts) {
+      attempts++;
+      logger.info(`CELLSCAN尝试 ${attempts}/${maxAttempts}`);
+
+      try {
+        const response = await new Promise<string>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error(`CELLSCAN命令超时 (尝试 ${attempts})`));
+          }, 30000);
+
+          let currentResponse = '';
+          
+          const onData = (data: Buffer) => {
+            currentResponse += data.toString();
+            
+            if (currentResponse.includes('OK') || currentResponse.includes('ERROR')) {
+              clearTimeout(timeout);
+              this.tcpSocket?.off('data', onData);
+              resolve(currentResponse);
+            }
+          };
+
+          this.tcpSocket!.on('data', onData);
+          this.tcpSocket!.write(command + '\r\n');
+        });
+
+        if (response && response.trim()) {
+          fullResponse += response;
+          logger.debug(`CELLSCAN响应 ${attempts}: ${response.substring(0, 200)}...`);
+          
+          if (response.includes('OK')) {
+            logger.info(`CELLSCAN完成，尝试次数: ${attempts}`);
+            completed = true;
+          }
+        } else {
+          logger.warn(`CELLSCAN尝试 ${attempts} 未收到响应`);
+        }
+
+        if (!completed && attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+      } catch (error) {
+        logger.warn(`CELLSCAN尝试 ${attempts} 失败:`, error);
+        
+        if (attempts < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+
+    if (!completed) {
+      throw new Error(`CELLSCAN命令未完成，已尝试 ${attempts} 次`);
+    }
+
+    logger.info(`CELLSCAN命令完成，总响应长度: ${fullResponse.length}`);
+    return fullResponse;
+  }
+
+  // 关闭连接
+  public async close(): Promise<void> {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (this.tcpSocket) {
+      this.tcpSocket.destroy();
+      this.tcpSocket = null;
+    }
+
+    if (this.unixSocket) {
+      this.unixSocket.destroy();
+      this.unixSocket = null;
+    }
+
+    this.isConnected = false;
+    logger.info('AT客户端连接已关闭');
+  }
+
+  // 解析信号信息
+  public parseSignalInfo(response: string): SignalData | null {
+    try {
+      if (!response.includes('^HCSQ:')) {
+        return null;
+      }
+
+      const data = response.split('^HCSQ:')[1].split('\r\n')[0];
+      const parts = data.split(',');
+      
+      if (parts.length >= 4) {
+        const sysmode = parts[0].replace(/"/g, '').trim();
+        const rsrp = parseInt(parts[1]) - 140;
+        const rsrq = parseFloat(parts[2]) / 2 - 19.5;
+        const sinr = parts[3] ? `${parseFloat(parts[3]) / 2 - 23} dB` : 'N/A';
+
+        return {
+          sysmode,
+          rsrp,
+          rsrq,
+          sinr,
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      return null;
+    } catch (error) {
+      logger.error('解析信号信息失败:', error);
+      return null;
+    }
+  }
+
+  // 解析芯片温度
+  public parseChipTemperature(response: string): ChipTemperature | null {
+    try {
+      if (!response.includes('^CHIPTEMP:')) {
+        return null;
+      }
+
+      const tempMatch = response.match(/\^CHIPTEMP:\s*(\d+)/);
+      if (tempMatch) {
+        const rawValue = parseInt(tempMatch[1]);
+        return {
+          temperature: `${rawValue}°C`,  // 转换为字符串格式
+          raw_value: rawValue,           // 保留原始数值
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      return null;
+    } catch (error) {
+      logger.error('解析芯片温度失败:', error);
+      return null;
+    }
+  }
+
+  // 解析5G状态
+  public parse5GStatus(response: string): any {
+    try {
+      // 简化实现
+      return {
+        status: 'connected',
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      logger.error('解析5G状态失败:', error);
+      return null;
+    }
+  }
+
+  // 解析锁定状态
+  public parseLockStatus(response: string): LockStatus | null {
+    try {
+      if (!response.includes('^NRFREQLOCK:')) {
+        return {
+          status: 'unlocked' as const,
+          info: 'None',
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      return {
+        status: 'locked' as const,
+        info: response,
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      logger.error('解析锁定状态失败:', error);
+      return null;
+    }
+  }
+
+  // 解析小区扫描结果
+  public parseCellScanResults(response: string): ScanResult[] {
+    try {
+      const results: ScanResult[] = [];
+      
+      if (!response || !response.includes('^CELLSCAN:')) {
+        logger.warn('扫描响应中未找到CELLSCAN数据');
+        return results;
+      }
+
+      // 分割响应为行
+      const lines = response.split('\n');
+      
+      for (const line of lines) {
+        if (line.includes('^CELLSCAN:')) {
+          try {
+            // 解析CELLSCAN行格式: ^CELLSCAN: rat,plmn,freq,pci,band,lac,scs,rsrp,rsrq,sinr,lte_sinr
+            const data = line.split('^CELLSCAN:')[1].trim();
+            const parts = data.split(',');
+            
+            if (parts.length >= 11) {
+              const scanResult: ScanResult = {
+                rat: parts[0].replace(/"/g, '').trim(),
+                plmn: parts[1].replace(/"/g, '').trim(),
+                freq: parseInt(parts[2]) || 0,
+                pci: parseInt(parts[3]) || 0,
+                band: parseInt(parts[4]) || 0,
+                lac: parseInt(parts[5]) || 0,
+                scs: parts[6].replace(/"/g, '').trim(),
+                rsrp: parseInt(parts[7]) || 0,
+                rsrq: parseInt(parts[8]) || 0,
+                sinr: parseInt(parts[9]) || 0,
+                lte_sinr: parseInt(parts[10]) || 0,
+                timestamp: new Date().toISOString()
+              };
+              
+              results.push(scanResult);
+            }
+          } catch (parseError) {
+            logger.warn('解析单个CELLSCAN行失败:', parseError, '行内容:', line);
+          }
+        }
+      }
+      
+      logger.info(`成功解析 ${results.length} 个小区扫描结果`);
+      return results;
+      
+    } catch (error) {
+      logger.error('解析小区扫描结果失败:', error);
+      return [];
+    }
+  }
+
+  public get connected(): boolean {
+    return this.isConnected;
+  }
+}

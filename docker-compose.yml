@@ -1,0 +1,44 @@
+services:
+  mt5700m-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 使用构建缓存
+      cache_from:
+        - mt5700m-webui:latest
+    image: mt5700m-webui:latest
+    container_name: mt5700m-webui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - MT5700M_IP=192.168.8.1
+      - MT5700M_PORT=20249
+      - TIMEOUT=5
+      - ENABLE_CORS=true
+    volumes:
+      # 挂载数据目录（持久化用户配置）
+      - ./data:/app/data
+      # 挂载日志目录
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    labels:
+      - "com.mt5700m.service=webui"
+      - "com.mt5700m.version=1.0.0"
+      - "traefik.enable=true"
+      - "traefik.http.routers.mt5700m.rule=Host(`mt5700m.local`)"
+      - "traefik.http.services.mt5700m.loadbalancer.server.port=3000"
+
+volumes:
+  data:
+    driver: local
+  logs:
+    driver: local

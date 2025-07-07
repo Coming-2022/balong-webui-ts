@@ -1,0 +1,302 @@
+import { EventEmitter } from 'events';
+import type { Server } from 'socket.io';
+import { ATClient } from './ATClient';
+import { logger, logPerformance } from '../utils/logger';
+import { config } from '../config';
+
+import type { 
+  ServerToClientEvents, 
+  ClientToServerEvents,
+  SignalData,
+  ChipTemperature,
+  NRCCStatus,
+  LockStatus
+} from '../../types';
+
+export class DeviceMonitor extends EventEmitter {
+  private atClient: ATClient;
+  private io: Server<ClientToServerEvents, ServerToClientEvents>;
+  private monitoringInterval: NodeJS.Timeout | null = null;
+  private isMonitoring = false;
+  private lastSignalData: SignalData | null = null;
+  private lastTemperature: ChipTemperature | null = null;
+  private lastNRCCStatus: NRCCStatus | null = null;
+  private lastLockStatus: LockStatus | null = null;
+
+  constructor(
+    atClient: ATClient, 
+    io: Server<ClientToServerEvents, ServerToClientEvents>
+  ) {
+    super();
+    this.atClient = atClient;
+    this.io = io;
+    
+    // 监听AT客户端连接状态
+    this.atClient.on('connected', () => {
+      this.io.emit('deviceUpdate', { connected: true });
+      logger.info('设备已连接，开始监控');
+    });
+    
+    this.atClient.on('disconnected', () => {
+      this.io.emit('deviceUpdate', { connected: false });
+      logger.warn('设备连接断开，停止监控');
+    });
+  }
+
+  public start(): void {
+    if (this.isMonitoring) {
+      logger.warn('设备监控已在运行');
+      return;
+    }
+
+    this.isMonitoring = true;
+    logger.info('启动设备监控', {
+      interval: config.monitoring.interval,
+      items: config.monitoring.items
+    });
+
+    // 立即执行一次监控
+    this.performMonitoring();
+
+    // 设置定时监控
+    this.monitoringInterval = setInterval(() => {
+      this.performMonitoring();
+    }, config.monitoring.interval);
+  }
+
+  public stop(): void {
+    if (!this.isMonitoring) {
+      return;
+    }
+
+    this.isMonitoring = false;
+    
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
+
+    logger.info('设备监控已停止');
+  }
+
+  private async performMonitoring(): Promise<void> {
+    if (!this.atClient.connected) {
+      return;
+    }
+
+    const startTime = Date.now();
+    const promises: Promise<void>[] = [];
+
+    // 根据配置监控不同项目
+    if (config.monitoring.items.includes('signal')) {
+      promises.push(this.monitorSignal());
+    }
+
+    if (config.monitoring.items.includes('temperature')) {
+      promises.push(this.monitorTemperature());
+    }
+
+    if (config.monitoring.items.includes('5g_status')) {
+      promises.push(this.monitor5GStatus());
+    }
+
+    if (config.monitoring.items.includes('lock_status')) {
+      promises.push(this.monitorLockStatus());
+    }
+
+    try {
+      await Promise.allSettled(promises);
+      
+      const duration = Date.now() - startTime;
+      logPerformance('device_monitoring', duration, {
+        items: config.monitoring.items.length
+      });
+      
+    } catch (error) {
+      logger.error('设备监控执行失败', error);
+    }
+  }
+
+  private async monitorSignal(): Promise<void> {
+    try {
+      const response = await this.atClient.sendCommand('AT^HCSQ?');
+      const signalData = this.atClient.parseSignalInfo(response);
+      
+      if (signalData && this.hasSignalChanged(signalData)) {
+        this.lastSignalData = signalData;
+        this.io.emit('signalUpdate', signalData);
+        
+        logger.debug('信号数据更新', {
+          rsrp: signalData.rsrp,
+          rsrq: signalData.rsrq,
+          sinr: signalData.sinr
+        });
+      }
+    } catch (error) {
+      logger.error('信号监控失败', error);
+    }
+  }
+
+  private async monitorTemperature(): Promise<void> {
+    try {
+      const response = await this.atClient.sendCommand('AT^CHIPTEMP?');
+      const temperature = this.atClient.parseChipTemperature(response);
+      
+      if (temperature && this.hasTemperatureChanged(temperature)) {
+        this.lastTemperature = temperature;
+        this.io.emit('temperatureUpdate', temperature);
+        
+        // 温度过高警告
+        if (temperature.raw_value > 600) { // 60°C
+          logger.warn('芯片温度过高', { temperature: temperature.temperature });
+          this.io.emit('error', `芯片温度过高: ${temperature.temperature}`);
+        }
+        
+        logger.debug('温度数据更新', { temperature: temperature.temperature });
+      }
+    } catch (error) {
+      logger.error('温度监控失败', error);
+    }
+  }
+
+  private async monitor5GStatus(): Promise<void> {
+    try {
+      const response = await this.atClient.sendCommand('AT^HFREQINFO?');
+      const nrccStatus = this.atClient.parse5GStatus(response);
+      
+      if (nrccStatus && this.hasNRCCStatusChanged(nrccStatus)) {
+        this.lastNRCCStatus = nrccStatus;
+        this.io.emit('deviceUpdate', { nrccStatus });
+        
+        logger.debug('5G状态更新', {
+          nr_count: nrccStatus.nr_count,
+          lte_count: nrccStatus.lte_count
+        });
+      }
+    } catch (error) {
+      logger.error('5G状态监控失败', error);
+    }
+  }
+
+  private async monitorLockStatus(): Promise<void> {
+    try {
+      const response = await this.atClient.sendCommand('AT^NRFREQLOCK?');
+      const lockStatus = this.atClient.parseLockStatus(response);
+      
+      if (lockStatus && this.hasLockStatusChanged(lockStatus)) {
+        this.lastLockStatus = lockStatus;
+        this.io.emit('lockStatusUpdate', lockStatus);
+        
+        logger.debug('锁定状态更新', { status: lockStatus.status });
+      }
+    } catch (error) {
+      logger.error('锁定状态监控失败', error);
+    }
+  }
+
+  // 数据变化检测
+  private hasSignalChanged(newData: SignalData): boolean {
+    if (!this.lastSignalData) return true;
+    
+    return (
+      this.lastSignalData.rsrp !== newData.rsrp ||
+      this.lastSignalData.rsrq !== newData.rsrq ||
+      this.lastSignalData.sinr !== newData.sinr ||
+      this.lastSignalData.sysmode !== newData.sysmode
+    );
+  }
+
+  private hasTemperatureChanged(newData: ChipTemperature): boolean {
+    if (!this.lastTemperature) return true;
+    
+    // 温度变化超过1度才推送
+    return Math.abs(this.lastTemperature.raw_value - newData.raw_value) >= 10;
+  }
+
+  private hasNRCCStatusChanged(newData: NRCCStatus): boolean {
+    if (!this.lastNRCCStatus) return true;
+    
+    return (
+      this.lastNRCCStatus.nr_count !== newData.nr_count ||
+      this.lastNRCCStatus.lte_count !== newData.lte_count
+    );
+  }
+
+  private hasLockStatusChanged(newData: LockStatus): boolean {
+    if (!this.lastLockStatus) return true;
+    
+    return (
+      this.lastLockStatus.status !== newData.status ||
+      this.lastLockStatus.info !== newData.info
+    );
+  }
+
+  // 手动触发监控
+  public async triggerMonitoring(items?: string[]): Promise<void> {
+    if (!this.atClient.connected) {
+      throw new Error('设备未连接');
+    }
+
+    const monitorItems = items || config.monitoring.items;
+    const promises: Promise<void>[] = [];
+
+    if (monitorItems.includes('signal')) {
+      promises.push(this.monitorSignal());
+    }
+
+    if (monitorItems.includes('temperature')) {
+      promises.push(this.monitorTemperature());
+    }
+
+    if (monitorItems.includes('5g_status')) {
+      promises.push(this.monitor5GStatus());
+    }
+
+    if (monitorItems.includes('lock_status')) {
+      promises.push(this.monitorLockStatus());
+    }
+
+    await Promise.allSettled(promises);
+  }
+
+  // 获取当前缓存的数据
+  public getCurrentData() {
+    return {
+      signal: this.lastSignalData,
+      temperature: this.lastTemperature,
+      nrccStatus: this.lastNRCCStatus,
+      lockStatus: this.lastLockStatus,
+      connected: this.atClient.connected,
+      monitoring: this.isMonitoring
+    };
+  }
+
+  // 设置监控间隔
+  public setMonitoringInterval(interval: number): void {
+    if (interval < 1000) {
+      throw new Error('监控间隔不能小于1秒');
+    }
+
+    config.monitoring.interval = interval;
+    
+    if (this.isMonitoring) {
+      this.stop();
+      this.start();
+    }
+
+    logger.info('监控间隔已更新', { interval });
+  }
+
+  // 设置监控项目
+  public setMonitoringItems(items: string[]): void {
+    const validItems = ['signal', 'temperature', '5g_status', 'lock_status'];
+    const filteredItems = items.filter(item => validItems.includes(item));
+    
+    if (filteredItems.length === 0) {
+      throw new Error('至少需要选择一个监控项目');
+    }
+
+    config.monitoring.items = filteredItems;
+    logger.info('监控项目已更新', { items: filteredItems });
+  }
+}

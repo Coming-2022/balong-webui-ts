@@ -1,0 +1,746 @@
+import type { Server } from 'socket.io';
+import { ATClient } from '../services/ATClient';
+import { DeviceMonitor } from '../services/DeviceMonitor';
+import { logger, logATCommand } from '../utils/logger';
+import { AT_COMMANDS } from '../config';
+
+import type { 
+  ServerToClientEvents, 
+  ClientToServerEvents,
+  APIResponse
+} from '../../types';
+
+// 小区扫描状态管理
+let cellScanInProgress = false;
+let cellScanResults: any[] = [];
+
+// 解析小区扫描响应
+const parseCellScanResponse = (response: string) => {
+  const results: any[] = [];
+  const lines = response.split('\n');
+  
+  for (const line of lines) {
+    if (line.startsWith('^CELLSCAN: ')) {
+      try {
+        const data = line.split(': ', 2)[1];
+        const fields = data.split(',');
+        
+        if (fields.length >= 15) { // 确保有足够的字段
+          const rat = parseInt(fields[0]);
+          let ratStr = 'Unknown';
+          
+          switch (rat) {
+            case 1: ratStr = 'UMTS (FDD)'; break;
+            case 2: ratStr = 'LTE'; break;
+            case 3: ratStr = 'NR'; break;
+          }
+          
+          // 根据Python代码的正确字段索引
+          const record = {
+            rat: ratStr,
+            plmn: fields[1]?.replace(/"/g, '') || '',
+            freq: parseInt(fields[2]) || 0,
+            pci: parseInt(fields[3]) || 0,
+            band: parseInt(fields[4], 16) || 0,
+            lac: parseInt(fields[5], 16) || 0,
+            scs: getSCSValue(parseInt(fields[10]) || 0),
+            rsrp: parseInt(fields[11]) || 0,  // 正确的RSRP字段
+            rsrq: fields[12] ? parseInt(fields[12]) * 0.5 : 0,  // 正确的RSRQ字段，需要乘以0.5
+            sinr: fields[13] ? parseInt(fields[13]) * 0.5 : 0,  // 正确的SINR字段，需要乘以0.5
+            lte_sinr: fields[14] ? parseInt(fields[14], 16) * 0.125 : 0,  // LTE SINR字段，需要乘以0.125
+            timestamp: new Date().toISOString()
+          };
+          
+          results.push(record);
+        }
+      } catch (error) {
+        logger.warn(`解析小区扫描行失败: ${line}`, error);
+      }
+    }
+  }
+  
+  return results;
+};
+
+// SCS值映射函数
+const getSCSValue = (scs: number): string => {
+  const scsMap: { [key: number]: string } = {
+    0: '15',
+    1: '30',
+    2: '60',
+    3: '120',
+    4: '240'
+  };
+  return scsMap[scs] || '15';
+};
+
+export function setupSocketHandlers(
+  io: Server<ClientToServerEvents, ServerToClientEvents>,
+  atClient: ATClient,
+  deviceMonitor: DeviceMonitor
+): void {
+  
+  io.on('connection', (socket) => {
+    const clientId = socket.id;
+    const clientIP = socket.handshake.address;
+    
+    logger.info('客户端连接', { clientId, clientIP });
+
+    // 发送当前设备状态
+    const currentData = deviceMonitor.getCurrentData();
+    socket.emit('deviceUpdate', {
+      connected: atClient.connected,
+      signal: currentData.signal || undefined,
+      temperature: currentData.temperature || undefined,
+      nrccStatus: currentData.nrccStatus || undefined,
+      lockStatus: currentData.lockStatus || undefined,
+      monitoring: currentData.monitoring
+    });
+
+    // 处理AT命令发送
+    socket.on('sendCommand', async (command: string, callback) => {
+      try {
+        if (!command || typeof command !== 'string') {
+          callback({
+            success: false,
+            error: '命令不能为空',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        const startTime = Date.now();
+        const response = await atClient.sendCommand(command.trim());
+        const duration = Date.now() - startTime;
+        
+        logATCommand(command, response);
+        
+        callback({
+          success: true,
+          data: {
+            command,
+            response,
+            duration
+          },
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : '命令执行失败';
+        logATCommand(command, undefined, errorMessage);
+        
+        callback({
+          success: false,
+          error: errorMessage,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 获取信号数据
+    socket.on('getSignal', async (callback) => {
+      try {
+        const response = await atClient.sendCommand(AT_COMMANDS.view_signal);
+        const signalData = atClient.parseSignalInfo(response);
+        
+        if (!signalData) {
+          callback({
+            success: false,
+            error: '信号数据解析失败',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        callback({
+          success: true,
+          data: signalData,
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '获取信号失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 获取5G状态
+    socket.on('get5GStatus', async (callback) => {
+      try {
+        const response = await atClient.sendCommand(AT_COMMANDS.view_5g_nr_cc_status);
+        const nrccData = atClient.parse5GStatus(response);
+        
+        if (!nrccData) {
+          callback({
+            success: false,
+            error: '5G状态数据解析失败',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        callback({
+          success: true,
+          data: nrccData,
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '获取5G状态失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 锁定小区
+    socket.on('lockCell', async (cellId: string, callback) => {
+      try {
+        if (!cellId || !(cellId in AT_COMMANDS)) {
+          callback({
+            success: false,
+            error: '无效的小区ID',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        // 发送锁定命令
+        const lockResponse = await atClient.sendCommand(AT_COMMANDS[cellId as keyof typeof AT_COMMANDS] as string);
+        
+        if (!lockResponse.includes('OK')) {
+          callback({
+            success: false,
+            error: '小区锁定失败',
+            data: lockResponse,
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        // 重启设备
+        const restartResponse = await atClient.sendCommand(AT_COMMANDS.restart_cellular);
+        
+        callback({
+          success: true,
+          message: '小区锁定成功，设备正在重启',
+          data: {
+            lockResponse,
+            restartResponse
+          },
+          timestamp: new Date().toISOString()
+        });
+
+        // 通知所有客户端
+        io.emit('deviceUpdate', { restarting: true });
+
+      } catch (error) {
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '小区锁定失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 解锁小区
+    socket.on('unlockCell', async (callback) => {
+      try {
+        const response = await atClient.sendCommand(AT_COMMANDS.unlock_cell);
+        
+        callback({
+          success: true,
+          message: '小区解锁成功',
+          data: response,
+          timestamp: new Date().toISOString()
+        });
+
+        // 触发锁定状态更新
+        setTimeout(() => {
+          deviceMonitor.triggerMonitoring(['lock_status']);
+        }, 1000);
+
+      } catch (error) {
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '小区解锁失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 测试事件处理器
+    socket.on('test', (data, callback) => {
+      logger.info('收到测试事件:', data);
+      if (callback) {
+        callback({
+          success: true,
+          message: '测试事件处理成功',
+          data: data,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 初始化配置
+    socket.on('initConfiguration', async (callback) => {
+      try {
+        logger.info('收到初始化配置请求');
+        
+        if (cellScanInProgress) {
+          logger.warn('小区扫描正在进行中，拒绝初始化配置请求');
+          callback({
+            success: false,
+            error: '小区扫描正在进行中，请稍后再试',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        const commands = [
+          { cmd: 'AT^C5GOPTION=1,1,1', desc: '设置5G选项' },
+          { cmd: 'AT^LTEFREQLOCK=0', desc: '解锁LTE频率' },
+          { cmd: 'AT^NRFREQLOCK=0', desc: '解锁NR频率' },
+          { cmd: 'AT^SYSCFGEX="0803",3FFFFFFF,1,2,7FFFFFFFFFFFFFFF,,', desc: '配置系统参数' }
+        ];
+
+        logger.info('发送初始进度事件');
+        socket.emit('scanProgress', { 
+          stage: 'init', 
+          message: '开始初始化配置...', 
+          progress: 0 
+        });
+
+        logger.info('开始执行初始化配置');
+
+        for (let i = 0; i < commands.length; i++) {
+          const { cmd, desc } = commands[i];
+          const progress = Math.round(((i + 1) / commands.length) * 100);
+          
+          logger.info(`执行初始化命令 ${i + 1}/${commands.length}: ${cmd}`);
+          
+          logger.info(`发送进度事件: ${desc}`);
+          socket.emit('scanProgress', { 
+            stage: 'init', 
+            message: `${desc}: ${cmd}`, 
+            progress: Math.round((i / commands.length) * 100) 
+          });
+
+          // 参考Python版本的重试逻辑
+          let response = '';
+          let retryCount = 0;
+          const maxRetries = 3;
+          
+          while (retryCount < maxRetries) {
+            try {
+              logger.info(`发送AT命令: ${cmd} (尝试 ${retryCount + 1}/${maxRetries})`);
+              response = await atClient.sendCommand(cmd);
+              logger.info(`AT命令响应: ${response.substring(0, 100)}...`);
+              
+              if (response.includes('OK')) {
+                logger.info(`命令执行成功 ${i + 1}/${commands.length}: ${cmd}`);
+                break; // 成功，跳出重试循环
+              } else {
+                logger.warn(`命令 '${cmd}' 未返回OK，响应: ${response}`);
+                retryCount++;
+                
+                if (retryCount < maxRetries) {
+                  logger.info(`命令 '${cmd}' 失败，重试中... (${retryCount}/${maxRetries})`);
+                  socket.emit('scanProgress', { 
+                    stage: 'init', 
+                    message: `${desc} - 重试中 (${retryCount}/${maxRetries})`, 
+                    progress: Math.round((i / commands.length) * 100) 
+                  });
+                  await new Promise(resolve => setTimeout(resolve, 2000)); // 等待2秒后重试
+                } else {
+                  throw new Error(`命令执行失败，已重试${maxRetries}次: ${cmd} - 响应: ${response}`);
+                }
+              }
+            } catch (cmdError) {
+              retryCount++;
+              logger.error(`命令执行异常 ${retryCount}/${maxRetries}: ${cmd}`, cmdError);
+              
+              if (retryCount < maxRetries) {
+                socket.emit('scanProgress', { 
+                  stage: 'init', 
+                  message: `${desc} - 重试中 (${retryCount}/${maxRetries})`, 
+                  progress: Math.round((i / commands.length) * 100) 
+                });
+                await new Promise(resolve => setTimeout(resolve, 2000));
+              } else {
+                throw new Error(`命令执行失败: ${cmd} - ${cmdError instanceof Error ? cmdError.message : '未知错误'}`);
+              }
+            }
+          }
+          
+          // 更新进度
+          logger.info(`发送完成进度事件: ${desc}`);
+          socket.emit('scanProgress', { 
+            stage: 'init', 
+            message: `${desc} - 完成`, 
+            progress: progress
+          });
+          
+          // 命令间延迟，参考Python版本
+          if (i < commands.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+
+        logger.info('发送最终完成事件');
+        socket.emit('scanProgress', { 
+          stage: 'init', 
+          message: '初始化配置完成！', 
+          progress: 100 
+        });
+
+        logger.info('初始化配置完成');
+
+        callback({
+          success: true,
+          message: '初始化配置完成',
+          data: {
+            commandsExecuted: commands.length,
+            commands: commands.map(c => c.cmd)
+          },
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        logger.error('初始化配置失败:', error);
+        
+        socket.emit('scanError', { 
+          stage: 'init', 
+          message: '初始化配置失败', 
+          error: error instanceof Error ? error.message : '未知错误' 
+        });
+        
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '初始化配置失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 开始小区扫描 - 基于Python版本逻辑
+    socket.on('startScan', async (callback) => {
+      try {
+        if (cellScanInProgress) {
+          callback({
+            success: false,
+            error: '小区扫描正在进行中，请稍后再试',
+            timestamp: new Date().toISOString()
+          });
+          return;
+        }
+
+        cellScanInProgress = true;
+        cellScanResults = [];
+
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '开始小区扫描...', 
+          progress: 0 
+        });
+
+        logger.info('开始小区扫描');
+
+        // 1. 解锁小区 - 参考Python版本，只使用AT^NRFREQLOCK=0
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '解锁小区...', 
+          progress: 10 
+        });
+        
+        logger.info('执行解锁小区命令: AT^NRFREQLOCK=0');
+        await atClient.sendCommand('AT^NRFREQLOCK=0');
+        logger.info('小区解锁完成');
+
+        // 2. 执行 AT+COPS=2 (参考Python版本的重试逻辑)
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '断开网络连接...', 
+          progress: 20 
+        });
+        
+        logger.info('执行AT+COPS=2命令');
+        let response = await atClient.sendCommand('AT+COPS=2');
+        let retries = 0;
+        while (!response.includes('OK') && retries < 5) {
+          logger.warn(`AT+COPS=2失败，重试 ${retries + 1}/5`);
+          socket.emit('scanProgress', { 
+            stage: 'scan', 
+            message: `断开网络连接 - 重试 ${retries + 1}/5`, 
+            progress: 20 
+          });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          response = await atClient.sendCommand('AT+COPS=2');
+          retries++;
+        }
+        
+        if (!response.includes('OK')) {
+          throw new Error('无法断开网络连接，AT+COPS=2执行失败');
+        }
+        logger.info('AT+COPS=2执行成功');
+
+        // 3. 执行小区扫描 - 完全按照Python版本的逻辑
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '正在扫描小区，这可能需要1-2分钟...', 
+          progress: 30 
+        });
+
+        logger.info('开始执行AT^CELLSCAN=3循环 - 按照Python版本逻辑');
+        const startTime = Date.now();
+        
+        let scanResponse = '';
+        let cellscanCompleted = false;
+        let attempts = 0;
+        const maxAttempts = 60;
+        
+        while (!cellscanCompleted && attempts < maxAttempts) {
+          attempts++;
+          logger.info(`等待AT^CELLSCAN=3完成... (尝试 ${attempts}/${maxAttempts})`);
+          
+          socket.emit('scanProgress', { 
+            stage: 'scan', 
+            message: `扫描小区中... (${attempts}/${maxAttempts})`, 
+            progress: Math.min(30 + (attempts / maxAttempts) * 50, 80)
+          });
+          
+          // 等待2秒，参考Python版本
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          try {
+            const newResponse = await atClient.sendCommand('AT^CELLSCAN=3');
+            logger.info(`CELLSCAN响应 ${attempts}: ${newResponse ? newResponse.substring(0, 100) + '...' : 'null'}`);
+            
+            if (newResponse && newResponse.trim()) {
+              scanResponse += newResponse;
+              
+              // 检查是否包含小区数据
+              if (newResponse.includes('^CELLSCAN:')) {
+                const cellCount = (newResponse.match(/\^CELLSCAN:/g) || []).length;
+                logger.info(`发现 ${cellCount} 个小区信息`);
+                socket.emit('scanProgress', { 
+                  stage: 'scan', 
+                  message: `发现 ${cellCount} 个小区信息...`, 
+                  progress: Math.min(30 + (attempts / maxAttempts) * 50, 80)
+                });
+              }
+              
+              // 检查是否完成
+              if (newResponse.includes('OK')) {
+                logger.info('小区扫描完成，收到OK响应');
+                cellscanCompleted = true;
+              }
+            } else {
+              logger.warn('未收到响应，继续重试');
+            }
+          } catch (error) {
+            logger.warn(`CELLSCAN尝试 ${attempts} 失败:`, error);
+          }
+        }
+        
+        const duration = Date.now() - startTime;
+        
+        if (!cellscanCompleted) {
+          throw new Error(`小区扫描超时 (尝试了${attempts}次，耗时${duration}ms)`);
+        }
+        
+        logger.info(`小区扫描完成，耗时: ${duration}ms, 总响应长度: ${scanResponse.length}`);
+
+        // 更新进度
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '小区扫描数据收集完成', 
+          progress: 80 
+        });
+
+        // 4. 解析扫描结果
+        socket.emit('scanProgress', { 
+          stage: 'scan', 
+          message: '解析扫描结果...', 
+          progress: 85 
+        });
+
+        cellScanResults = parseCellScanResponse(scanResponse);
+        logger.info(`小区扫描完成，发现 ${cellScanResults.length} 个小区`);
+
+        // 🔧 关键修复: 扫描完成后立即返回结果给前端，不执行AT+COPS=0
+        // 让前端处理小区数据，用户选择后再调用恢复网络的接口
+        socket.emit('scanProgress', { 
+          stage: 'completed', 
+          message: '小区扫描完成，请选择要锁定的小区', 
+          progress: 100 
+        });
+
+        socket.emit('scanCompleted', { 
+          stage: 'scan', 
+          message: '小区扫描完成', 
+          progress: 100 
+        });
+
+        // 发送扫描结果
+        socket.emit('scanComplete', {
+          success: true,
+          results: cellScanResults,
+          count: cellScanResults.length,
+          timestamp: new Date().toISOString()
+        });
+
+        callback({
+          success: true,
+          message: `小区扫描完成，发现 ${cellScanResults.length} 个小区`,
+          data: {
+            results: cellScanResults,
+            count: cellScanResults.length
+          },
+          timestamp: new Date().toISOString()
+        });
+
+      } catch (error) {
+        logger.error('小区扫描失败:', error);
+        
+        socket.emit('scanError', {
+          stage: 'scan',
+          message: '小区扫描失败',
+          error: error instanceof Error ? error.message : '未知错误'
+        });
+
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '小区扫描失败',
+          timestamp: new Date().toISOString()
+        });
+      } finally {
+        cellScanInProgress = false;
+      }
+    });
+
+    // 获取扫描状态
+    socket.on('getScanStatus', (callback) => {
+      callback({
+        success: true,
+        data: {
+          inProgress: cellScanInProgress,
+          results: cellScanResults,
+          count: cellScanResults.length
+        },
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // 新增：恢复网络连接的WebSocket处理器
+    socket.on('restoreNetwork', async (callback) => {
+      try {
+        logger.info('WebSocket: 执行AT+COPS=0恢复网络');
+        
+        socket.emit('networkRestoreProgress', { 
+          stage: 'restore', 
+          message: '恢复网络连接...', 
+          progress: 50 
+        });
+        
+        let response = await atClient.sendCommand('AT+COPS=0', 30000); // 增加超时时间
+        let retries = 0;
+        
+        while (!response.includes('OK') && retries < 5) {
+          logger.warn(`AT+COPS=0失败，重试 ${retries + 1}/5`);
+          socket.emit('networkRestoreProgress', { 
+            stage: 'restore', 
+            message: `恢复网络连接 - 重试 ${retries + 1}/5`, 
+            progress: 50 + (retries * 10) 
+          });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          response = await atClient.sendCommand('AT+COPS=0', 30000);
+          retries++;
+        }
+        
+        if (!response.includes('OK')) {
+          logger.warn('AT+COPS=0执行失败');
+          socket.emit('networkRestoreError', {
+            stage: 'restore',
+            message: 'AT+COPS=0执行失败',
+            error: 'Network restore timeout'
+          });
+          callback({
+            success: false,
+            error: 'AT+COPS=0执行失败',
+            timestamp: new Date().toISOString()
+          });
+        } else {
+          logger.info('AT+COPS=0执行成功，网络连接已恢复');
+          socket.emit('networkRestoreComplete', { 
+            stage: 'restore', 
+            message: '网络连接已恢复', 
+            progress: 100 
+          });
+          callback({
+            success: true,
+            message: '网络连接已恢复',
+            timestamp: new Date().toISOString()
+          });
+        }
+
+      } catch (error) {
+        logger.error('网络恢复失败:', error);
+        socket.emit('networkRestoreError', {
+          stage: 'restore',
+          message: '网络恢复失败',
+          error: error instanceof Error ? error.message : '未知错误'
+        });
+        callback({
+          success: false,
+          error: error instanceof Error ? error.message : '网络恢复失败',
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    // 启用/禁用监控
+    socket.on('enableMonitoring', (enabled: boolean) => {
+      try {
+        if (enabled) {
+          deviceMonitor.start();
+          logger.info('客户端启用设备监控', { clientId });
+        } else {
+          deviceMonitor.stop();
+          logger.info('客户端禁用设备监控', { clientId });
+        }
+        
+        socket.emit('deviceUpdate', { monitoring: enabled });
+        
+      } catch (error) {
+        socket.emit('error', error instanceof Error ? error.message : '监控状态切换失败');
+      }
+    });
+
+    // 客户端断开连接
+    socket.on('disconnect', (reason) => {
+      logger.info('客户端断开连接', { clientId, reason });
+    });
+
+    // 错误处理
+    socket.on('error', (error) => {
+      logger.error('Socket错误', { clientId, error });
+    });
+  });
+
+  // 全局错误处理
+  io.engine.on('connection_error', (err) => {
+    logger.error('Socket.IO连接错误', {
+      code: err.code,
+      message: err.message,
+      context: err.context,
+      type: err.type
+    });
+  });
+
+  logger.info('Socket.IO事件处理器已设置完成');
+}

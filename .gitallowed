@@ -1,0 +1,12 @@
+# Git secrets allowed patterns
+# This file contains regular expressions for allowed secrets/keys that are false positives
+
+# GPG public keys in node_modules documentation
+node_modules/readable-stream/README\.md:.*Release GPG key:.*
+
+# Example private keys in dotenv documentation (not real keys)
+node_modules/dotenv/README.*\.md:.*PRIVATE_KEY=.*BEGIN RSA PRIVATE KEY.*
+
+# General pattern for documentation examples in node_modules
+node_modules/.*/README.*\.md:.*PRIVATE_KEY.*
+node_modules/.*/README.*\.md:.*GPG key:.*
