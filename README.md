@@ -370,11 +370,6 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 4. 推送到分支 (`git push origin feature/AmazingFeature`)
 5. 创建 Pull Request
 
-## 📞 技术支持
-
-- 📧 邮件支持: support@example.com
-- 🐛 问题反馈: [GitHub Issues](https://github.com/your-repo/issues)
-- 📖 文档中心: [Wiki](https://github.com/your-repo/wiki)
 
 ## 🙏 致谢
 

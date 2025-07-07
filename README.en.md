@@ -370,12 +370,6 @@ MIT License - See [LICENSE](LICENSE) file for details
 4. Push to branch (`git push origin feature/AmazingFeature`)
 5. Create Pull Request
 
-## 📞 Technical Support
-
-- 📧 Email Support: support@example.com
-- 🐛 Issue Reporting: [GitHub Issues](https://github.com/your-repo/issues)
-- 📖 Documentation Center: [Wiki](https://github.com/your-repo/wiki)
-
 ## 🙏 Acknowledgments
 
 Thanks to all developers and users who have contributed to this project!
